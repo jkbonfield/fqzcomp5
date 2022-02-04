@@ -546,6 +546,7 @@ int main(int argc, char **argv) {
 	    out = decode_names(comp, c_len, &u_len);
 	    fq->name_buf = out;
 	    fq->name_len = u_len;
+	    free(comp);
 
 	    // ----------
 	    // Lengths
@@ -590,6 +591,7 @@ int main(int argc, char **argv) {
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
+	    free(comp);
 	    fq->seq_buf = out;
 	    fq->seq_len = u_len;
 	    for (i = 0; i < nr; i++)
@@ -617,6 +619,7 @@ int main(int argc, char **argv) {
 	    int *lengths = malloc(nr * sizeof(lengths));
 	    out = fqz_decompress((char *)comp, c_len, &out_len,
 				 lengths, nr, &s);
+	    free(comp);
 	    fq->qual_buf = out;
 	    fq->qual_len = out_len;
 	    //fq->len = lengths;
@@ -637,8 +640,7 @@ int main(int argc, char **argv) {
 	    }
 
 	    free(lengths);
-	    free(out);
-	    free(fq);
+	    fastq_free(fq);
 	}
 
     } else {
