@@ -155,7 +155,7 @@ fastq *load_seqs(FILE *in, int blk_size) {
     char *qual_buf = fq->qual_buf = malloc(qual_sz);
     if (!name_buf || !seq_buf || !qual_buf)
 	goto err;
-    int c, i, nr = 0, ar = 0;
+    int c, i = 0, nr = 0, ar = 0;
     int last_name = -1;
     fq->fixed_len = -1;
 
@@ -243,7 +243,7 @@ fastq *load_seqs(FILE *in, int blk_size) {
 		qual_sz = qual_sz * 1.5 + 1000;
 		qual_buf = fq->qual_buf = realloc(fq->qual_buf, qual_sz);
 	    }
-	    qual_buf[qual_i++] = c;
+	    qual_buf[qual_i++] = c-33;
 	}
 	if (c == EOF)
 	    goto err;
@@ -457,6 +457,223 @@ int fqz_manual_parameters(fqz_gparams *gp,
     return 0;
 }
 
+#define NSYM 256
+#define STEP 8
+// FIXME: a dedicated base encoder would be much faster here
+#include "htscodecs/c_simple_model.h"
+#undef NSYM
+#undef STEP
+
+// Why is NSYM 5 so much poorer than NSYM 4?
+// Do all those remainder probabilities really add up to be that significant?
+#define NSYM 4
+#define STEP 1
+#include "htscodecs/c_simple_model.h"
+// An order-N arithmetic encoder, dedicated to sequence contexts.
+char *encode_seq(unsigned char *in,  unsigned int in_size,
+		 int ctx_size,
+		 /*unsigned char *out,*/ unsigned int *out_size) {
+    char *out = malloc(in_size + 100);
+    if (!out)
+	return NULL;
+
+    const int msize = 1<<(2*ctx_size);
+    const int mask = msize-1;
+
+    SIMPLE_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
+    int i;
+
+    // Do histogram to get observed values.
+    // Then set m to max number of elements in histogram.
+    int m = NSYM;
+
+    for (i = 0; i < msize; i++)
+	SIMPLE_MODEL(NSYM,_init)(&seq_model[i], m);
+
+    SIMPLE_MODEL(256,_) run_len4;
+    SIMPLE_MODEL(256,_init)(&run_len4, 256);
+    SIMPLE_MODEL(256,_) run_lenN;
+    SIMPLE_MODEL(256,_init)(&run_lenN, 256);
+    SIMPLE_MODEL(256,_) literal;
+    SIMPLE_MODEL(256,_init)(&literal, 256);
+
+    RangeCoder rc;
+    RC_SetOutput(&rc, (char *)out);
+    RC_StartEncode(&rc);
+
+    int last, last2;
+    /* Corresponds to a 12-mer word that doesn't occur in human genome. */
+    last  = 0x007616c7 & mask;
+    //last2 = (0x2c6b62ff >> (32 - 2*ctx)) & mask; // both strands mode
+
+    int L[256];
+    for (int i = 0; i < 256; i++)
+	L[i] = 4; // N
+    L['A'] = L['a'] = 0;
+    L['C'] = L['c'] = 1;
+    L['G'] = L['g'] = 2;
+    L['T'] = L['t'] = 3;
+
+    // TODO: add an escape mechanism for within ACGT.
+    // Like RLE it could be a count of ACGTs, followed by a
+    // count of non-ACGTs and a different simpler model.
+#if NSYM>4
+    for (int i = 0; i < in_size; i++) {
+	unsigned char b = L[in[i]];
+	SIMPLE_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
+	last = ((last<<2) + b) & mask;
+    }
+#else
+    for (int i = 0; i < in_size; ) {//i++) {
+	// ACGT symbols
+	int j;
+	for (j = i; j < in_size; j++) {
+	    if (L[in[j]] == 4)
+		break;
+	}
+	int run = j-i, r2 = run;
+	for (;;) {
+	    SIMPLE_MODEL(256, _encodeSymbol)(&run_len4, &rc, MIN(255, r2));
+	    //fprintf(stderr, "run4 %d\n", MIN(255, r2));
+	    if (r2 >= 255)
+		r2 -= 255;
+	    else
+		break;
+	}
+
+	for (j = 0; j < run; j++) {
+	    unsigned char b = L[in[i+j]];
+	    SIMPLE_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
+	    last = ((last<<2) + b) & mask;
+
+//	    if (1) { // both strands
+//		int b2 = last2 & 3;
+//		last2 = last2/4 + ((3-b) << (2*NS-2));
+//		_mm_prefetch((const char *)&model_seq8[last2], _MM_HINT_T0);
+//		SIMPLE_MODEL(NSYM, _updateSymbol)(b2);
+//	    }
+	}
+	i += run;
+	if (i >= in_size)
+	    break;
+
+	// non-ACGT symbols
+	for (j = i; j < in_size; j++) {
+	    if (L[in[j]] != 4)
+		break;
+	}
+	run = j-i; r2 = run;
+	for (;;) {
+	    SIMPLE_MODEL(256, _encodeSymbol)(&run_lenN, &rc, MIN(255, r2));
+	    //fprintf(stderr, "runN %d\n", MIN(255, r2));
+	    if (r2 >= 255)
+		r2 -= 255;
+	    else
+		break;
+	}
+
+	for (j = 0; j < run; j++)
+	    SIMPLE_MODEL(256, _encodeSymbol)(&literal, &rc, in[i+j]);
+	i += run;
+    }
+#endif
+
+    RC_FinishEncode(&rc);
+    *out_size = RC_OutSize(&rc);
+
+    free(seq_model);
+
+    return out;
+}
+
+char *decode_seq(unsigned char *in,  unsigned int in_size,
+		 int ctx_size,
+		 /*unsigned char *out,*/ unsigned int out_size) {
+    char *out = malloc(out_size);
+    if (!out)
+	return NULL;
+
+    const int msize = 1<<(2*ctx_size);
+    const int mask = msize-1;
+
+    SIMPLE_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
+    int i;
+
+    // Do histogram to get observed values.
+    // Then set m to max number of elements in histogram.
+    int m = NSYM;
+
+    for (i = 0; i < msize; i++)
+	SIMPLE_MODEL(NSYM,_init)(&seq_model[i], m);
+
+    SIMPLE_MODEL(256,_) run_len4;
+    SIMPLE_MODEL(256,_init)(&run_len4, 256);
+    SIMPLE_MODEL(256,_) run_lenN;
+    SIMPLE_MODEL(256,_init)(&run_lenN, 256);
+    SIMPLE_MODEL(256,_) literal;
+    SIMPLE_MODEL(256,_init)(&literal, 256);
+
+    RangeCoder rc;
+    RC_SetInput(&rc, in, in+in_size);
+    RC_StartDecode(&rc);
+
+    int last, last2;
+    /* Corresponds to a 12-mer word that doesn't occur in human genome. */
+    last  = 0x007616c7 & mask;
+    //last2 = (0x2c6b62ff >> (32 - 2*ctx)) & mask; // both strands mode
+
+    // TODO: add an escape mechanism for within ACGT.
+    // Like RLE it could be a count of ACGTs, followed by a
+    // count of non-ACGTs and a different simpler model.
+#if NSYM<=4
+    for (int i = 0; i < out_size;) {
+	// ACGTs
+	int run = 0, r2, j;
+	do {
+	    r2 = SIMPLE_MODEL(256, _decodeSymbol)(&run_len4, &rc);
+	    //fprintf(stderr, "run4 %d\n", r2);
+	    run += r2;
+	} while (r2 == 255);
+
+	for (j = 0; j < run; j++) {
+	    unsigned char b =
+		SIMPLE_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
+	    last = ((last<<2) + b) & mask;
+	    out[i+j] = "ACGT"[b];
+	}
+	i += run;
+	if (i >= out_size)
+	    break;
+
+	// non ACGT
+	run = 0;
+	do {
+	    r2 = SIMPLE_MODEL(256, _decodeSymbol)(&run_lenN, &rc);
+	    //fprintf(stderr, "runN %d\n", r2);
+	    run += r2;
+	} while (r2 == 255);
+
+	for (j = 0; j < run; j++)
+	    out[i+j] = SIMPLE_MODEL(256, _decodeSymbol)(&literal, &rc);
+	i += run;
+    }
+#else
+    for (int i = 0; i < out_size; i++) {
+	unsigned char b =
+	    SIMPLE_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
+	last = ((last<<2) + b) & mask;
+	out[i] = "ACGTN"[b];
+    }
+#endif
+
+    RC_FinishDecode(&rc);
+
+    free(seq_model);
+
+    return out;
+}
+
+
 #define BLK_SIZE 300*1000000
 //#define BLK_SIZE 10*1000000
 
@@ -543,7 +760,7 @@ int main(int argc, char **argv) {
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
 
-	    out = decode_names(comp, c_len, &u_len);
+	    out = tok3_decode_names(comp, c_len, &u_len);
 	    fq->name_buf = out;
 	    fq->name_len = u_len;
 	    free(comp);
@@ -590,7 +807,11 @@ int main(int argc, char **argv) {
 	    comp = malloc(c_len);
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
+#if 1
+	    out = decode_seq(comp, c_len, SEQ_CTX, u_len);
+#else
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
+#endif
 	    free(comp);
 	    fq->seq_buf = out;
 	    fq->seq_len = u_len;
@@ -599,6 +820,7 @@ int main(int argc, char **argv) {
 
 	    // ----------
 	    // Qual
+	    int mode = getc(in_fp);
 	    if (fread(&u_len, 1, 4, in_fp) != 4)
 		break;
 	    if (fread(&c_len, 1, 4, in_fp) != 4)
@@ -607,23 +829,33 @@ int main(int argc, char **argv) {
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
 
-	    fqz_slice s;
-	    s.num_records = fq->num_records;
-	    s.len = fq->len;
-	    s.flags = fq->flag;
-	    //s.seq = (unsigned char **)fq->seq;
-	    s.seq = (unsigned char **)malloc(fq->num_records * sizeof(char *));
-	    for (i = j = 0; i < fq->num_records; j += fq->len[i++])
-		s.seq[i] = fq->seq_buf + j;
+	    if (mode == 0) {
+		// Rans
+		out = rans_uncompress_4x16(comp, c_len, &u_len);
+		fq->qual_buf = out;
+		fq->qual_len = u_len;
+	    } else {
+		// FQZComp qual
+		fqz_slice s;
+		s.num_records = fq->num_records;
+		s.len = fq->len;
+		s.flags = fq->flag;
+		//s.seq = (unsigned char **)fq->seq;
+		s.seq = (unsigned char **)malloc(fq->num_records * sizeof(char *));
+		for (i = j = 0; i < fq->num_records; j += fq->len[i++])
+		    s.seq[i] = fq->seq_buf + j;
 
-	    int *lengths = malloc(nr * sizeof(lengths));
-	    out = fqz_decompress((char *)comp, c_len, &out_len,
-				 lengths, nr, &s);
+		int *lengths = malloc(nr * sizeof(lengths));
+		out = fqz_decompress((char *)comp, c_len, &out_len,
+				     lengths, nr, &s);
+		fq->qual_buf = out;
+		fq->qual_len = out_len;
+		free(s.seq);
+		free(lengths);
+	    }
 	    free(comp);
-	    fq->qual_buf = out;
-	    fq->qual_len = out_len;
-	    //fq->len = lengths;
-	    free(s.seq);
+	    for (i = 0; i < fq->qual_len; i++)
+		fq->qual_buf[i] += 33;
 
 	    // ----------
 	    // Convert back to fastq
@@ -639,7 +871,6 @@ int main(int argc, char **argv) {
 		qp += fq->len[i];
 	    }
 
-	    free(lengths);
 	    fastq_free(fq);
 	}
 
@@ -665,7 +896,8 @@ int main(int argc, char **argv) {
 	    //----------
 	    // Names: tok3
 	    int clen;
-	    out = encode_names(fq->name_buf, fq->name_len, 5, 0, &clen, NULL);
+	    out = tok3_encode_names(fq->name_buf, fq->name_len, 5, 0,
+				    &clen, NULL);
 	    fwrite(&fq->name_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
@@ -699,7 +931,13 @@ int main(int argc, char **argv) {
 
 	    //----------
 	    // Seq: rans or statistical modelling
-
+#if 1
+	    out = encode_seq(fq->seq_buf, fq->seq_len, SEQ_CTX, &clen);
+	    fwrite(&fq->seq_len, 1, 4, out_fp);
+	    fwrite(&clen, 1, 4, out_fp);
+	    fwrite(out, 1, clen, out_fp);
+	    free(out);
+#else
 	    // FIXME: test 197, 65 and 1
 	    // FIXME: also try fqz for encoding, qmap and qshift=2.
 	    // But need extension to permit reverse complement.
@@ -709,27 +947,40 @@ int main(int argc, char **argv) {
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
 	    free(out);
+#endif
 	    fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
 
 	    //----------
 	    // Qual: rans or fqz
 	    // Convert fastq struct to fqz_slice for context
-	    fqz_slice *s = malloc(fq->num_records * sizeof(*s));
-	    s->num_records = fq->num_records;
-	    s->len = fq->len;
-	    s->flags = fq->flag;
-	    s->seq = malloc(fq->num_records * sizeof(char *));
-	    int i, j;
-	    for (i = j = 0; i < fq->num_records; j += fq->len[i++])
-		s->seq[i] = fq->seq_buf + j;
+	    if (0) {
+		// Fast mode
+		putc(0, out_fp);
+		out = rans_compress_4x16(fq->qual_buf, fq->seq_len,
+					 &clen, 193);
+		// crash on /tmp/_1m4.fq with mode 197.  Why?
+		out_len = clen;
+	    } else {
+		putc(1, out_fp);
+		fqz_slice *s = malloc(fq->num_records * sizeof(*s));
+		s->num_records = fq->num_records;
+		s->len = fq->len;
+		s->flags = fq->flag;
+		s->seq = malloc(fq->num_records * sizeof(char *));
+		int i, j;
+		for (i = j = 0; i < fq->num_records; j += fq->len[i++])
+		    s->seq[i] = fq->seq_buf + j;
 
-	    // FIXME: expose fqz_pick_parameters function so we
-	    // can initialise it here and then also turn off DO_LEN.
+		// FIXME: expose fqz_pick_parameters function so we
+		// can initialise it here and then also turn off DO_LEN.
 
-	    // Concatenate qualities together into a single block.
-	    // FIXME: move qual down by 33, '!'.
-	    out = fqz_compress(vers, s, fq->qual_buf, fq->qual_len,
-			       &out_len, strat, gp);
+		// Concatenate qualities together into a single block.
+		// FIXME: move qual down by 33, '!'.
+		out = fqz_compress(vers, s, fq->qual_buf, fq->qual_len,
+				   &out_len, strat, gp);
+		free(s->seq);
+		free(s);
+	    }
 	    fwrite(&fq->qual_len, 1, 4, out_fp);
 	    fwrite(&out_len, 1, 4, out_fp);
 	    fwrite(out, 1, out_len, out_fp);
@@ -737,8 +988,6 @@ int main(int argc, char **argv) {
 	    fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
 
 	    fastq_free(fq);
-	    free(s->seq);
-	    free(s);
 	}
     }
 
