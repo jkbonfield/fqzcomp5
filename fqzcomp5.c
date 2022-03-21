@@ -80,6 +80,10 @@
 #define MAX_REC 1000000
 #endif
 
+#ifndef SEQ_CTX
+# define SEQ_CTX 12
+#endif
+
 #ifndef MAX_SEQ
 #  define MAX_SEQ 100000
 #endif
@@ -466,9 +470,13 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
 // Why is NSYM 5 so much poorer than NSYM 4?
 // Do all those remainder probabilities really add up to be that significant?
+#undef MAX_FREQ
+#define MAX_FREQ 255
 #define NSYM 4
 #define STEP 1
-#include "htscodecs/c_simple_model.h"
+//#include "htscodecs/c_simple_model.h"
+#include "htscodecs/c_small_model.h"
+
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
 		 int ctx_size,
@@ -480,15 +488,13 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
     const int msize = 1<<(2*ctx_size);
     const int mask = msize-1;
 
-    SIMPLE_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
+    SMALL_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
     int i;
 
     // Do histogram to get observed values.
     // Then set m to max number of elements in histogram.
-    int m = NSYM;
-
     for (i = 0; i < msize; i++)
-	SIMPLE_MODEL(NSYM,_init)(&seq_model[i], m);
+	SMALL_MODEL(NSYM,_init)(&seq_model[i]);
 
     SIMPLE_MODEL(256,_) run_len4;
     SIMPLE_MODEL(256,_init)(&run_len4, 256);
@@ -520,7 +526,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 #if NSYM>4
     for (int i = 0; i < in_size; i++) {
 	unsigned char b = L[in[i]];
-	SIMPLE_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
+	SMALL_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
 	last = ((last<<2) + b) & mask;
     }
 #else
@@ -543,7 +549,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 
 	for (j = 0; j < run; j++) {
 	    unsigned char b = L[in[i+j]];
-	    SIMPLE_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
+	    SMALL_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
 	    last = ((last<<2) + b) & mask;
 
 //	    if (1) { // both strands
@@ -596,15 +602,13 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
     const int msize = 1<<(2*ctx_size);
     const int mask = msize-1;
 
-    SIMPLE_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
+    SMALL_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
     int i;
 
     // Do histogram to get observed values.
     // Then set m to max number of elements in histogram.
-    int m = NSYM;
-
     for (i = 0; i < msize; i++)
-	SIMPLE_MODEL(NSYM,_init)(&seq_model[i], m);
+	SMALL_MODEL(NSYM,_init)(&seq_model[i]);
 
     SIMPLE_MODEL(256,_) run_len4;
     SIMPLE_MODEL(256,_init)(&run_len4, 256);
@@ -637,7 +641,7 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 
 	for (j = 0; j < run; j++) {
 	    unsigned char b =
-		SIMPLE_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
+		SMALL_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
 	    last = ((last<<2) + b) & mask;
 	    out[i+j] = "ACGT"[b];
 	}
@@ -660,7 +664,7 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 #else
     for (int i = 0; i < out_size; i++) {
 	unsigned char b =
-	    SIMPLE_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
+	    SMALL_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
 	last = ((last<<2) + b) & mask;
 	out[i] = "ACGTN"[b];
     }
