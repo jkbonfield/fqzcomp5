@@ -552,6 +552,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 	    unsigned char b = L[in[i+j]];
 	    SMALL_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
 	    last = ((last<<2) + b) & mask;
+	    _mm_prefetch((const char *)&seq_model[(last<<4)&mask], _MM_HINT_T0);
 
 //	    if (1) { // both strands
 //		int b2 = last2 & 3;
@@ -644,6 +645,8 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 	    unsigned char b =
 		SMALL_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
 	    last = ((last<<2) + b) & mask;
+	    // seq_model is 4 bytes, so can prefetch all 4 upcoing combinations
+	    _mm_prefetch((const char *)&seq_model[(last<<4)&mask], _MM_HINT_T0);
 	    out[i+j] = "ACGT"[b];
 	}
 	i += run;
