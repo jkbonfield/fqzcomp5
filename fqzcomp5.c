@@ -985,7 +985,7 @@ int main(int argc, char **argv) {
 	    gettimeofday(&tv1, NULL);
 	    int clen;
 
-	    out = tok3_encode_names(fq->name_buf, fq->name_len, 5, 0,
+	    out = tok3_encode_names(fq->name_buf, fq->name_len, 7, 0,
 				    &clen, NULL);
 	    fwrite(&fq->name_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
