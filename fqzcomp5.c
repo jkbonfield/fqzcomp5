@@ -69,6 +69,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
+#include <sys/time.h>
 
 #include "htscodecs/varint.h"
 #include "htscodecs/fqzcomp_qual.h"
@@ -744,6 +745,8 @@ int main(int argc, char **argv) {
     // FIXME: use variable sized integers
 
     // Block based, for arbitrary sizes of input
+    int64_t ntime = 0, stime = 0, qtime = 0;
+    struct timeval tv1, tv2;
     if (decomp) {
 	for (;;) {
 	    // Load next compressed block
@@ -764,10 +767,14 @@ int main(int argc, char **argv) {
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
 
+	    gettimeofday(&tv1, NULL);
 	    out = tok3_decode_names(comp, c_len, &u_len);
 	    fq->name_buf = out;
 	    fq->name_len = u_len;
 	    free(comp);
+	    gettimeofday(&tv2, NULL);
+	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    ntime += tv2.tv_usec - tv1.tv_usec;
 
 	    // ----------
 	    // Lengths
@@ -811,6 +818,7 @@ int main(int argc, char **argv) {
 	    comp = malloc(c_len);
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
+	    gettimeofday(&tv1, NULL);
 #if 1
 	    out = decode_seq(comp, c_len, SEQ_CTX, u_len);
 #else
@@ -821,6 +829,9 @@ int main(int argc, char **argv) {
 	    fq->seq_len = u_len;
 	    for (i = 0; i < nr; i++)
 		fq->seq[i] = i ? fq->seq[i-1] + fq->len[i-1] : 0;
+	    gettimeofday(&tv2, NULL);
+	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    stime += tv2.tv_usec - tv1.tv_usec;
 
 	    // ----------
 	    // Qual
@@ -833,6 +844,7 @@ int main(int argc, char **argv) {
 	    if (fread(comp, 1, c_len, in_fp) != c_len)
 		break;
 
+	    gettimeofday(&tv1, NULL);
 	    if (mode == 0) {
 		// Rans
 		out = rans_uncompress_4x16(comp, c_len, &u_len);
@@ -860,6 +872,9 @@ int main(int argc, char **argv) {
 	    free(comp);
 	    for (i = 0; i < fq->qual_len; i++)
 		fq->qual_buf[i] += 33;
+	    gettimeofday(&tv2, NULL);
+	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    qtime += tv2.tv_usec - tv1.tv_usec;
 
 	    // ----------
 	    // Convert back to fastq
@@ -899,7 +914,9 @@ int main(int argc, char **argv) {
 
 	    //----------
 	    // Names: tok3
+	    gettimeofday(&tv1, NULL);
 	    int clen;
+
 	    out = tok3_encode_names(fq->name_buf, fq->name_len, 5, 0,
 				    &clen, NULL);
 	    fwrite(&fq->name_len, 1, 4, out_fp);
@@ -907,6 +924,9 @@ int main(int argc, char **argv) {
 	    fwrite(out, 1, clen, out_fp);
 	    free(out);
 	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+	    gettimeofday(&tv2, NULL);
+	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    ntime += tv2.tv_usec - tv1.tv_usec;
 
 	    //----------
 	    // Read lengths
@@ -935,6 +955,7 @@ int main(int argc, char **argv) {
 
 	    //----------
 	    // Seq: rans or statistical modelling
+	    gettimeofday(&tv1, NULL);
 #if 1
 	    out = encode_seq(fq->seq_buf, fq->seq_len, SEQ_CTX, &clen);
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
@@ -953,10 +974,14 @@ int main(int argc, char **argv) {
 	    free(out);
 #endif
 	    fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
+	    gettimeofday(&tv2, NULL);
+	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    stime += tv2.tv_usec - tv1.tv_usec;
 
 	    //----------
 	    // Qual: rans or fqz
 	    // Convert fastq struct to fqz_slice for context
+	    gettimeofday(&tv1, NULL);
 	    if (0) {
 		// Fast mode
 		putc(0, out_fp);
@@ -990,10 +1015,16 @@ int main(int argc, char **argv) {
 	    fwrite(out, 1, out_len, out_fp);
 	    free(out);
 	    fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
+	    gettimeofday(&tv2, NULL);
+	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	    qtime += tv2.tv_usec - tv1.tv_usec;
 
 	    fastq_free(fq);
 	}
     }
+    fprintf(stderr, "name time: %ld usec\n", ntime);
+    fprintf(stderr, "seq  time: %ld usec\n", stime);
+    fprintf(stderr, "qual time: %ld usec\n", qtime);
 
     fclose(in_fp);
     fclose(out_fp);
