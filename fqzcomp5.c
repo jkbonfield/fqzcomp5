@@ -82,7 +82,8 @@
 #endif
 
 #ifndef SEQ_CTX
-# define SEQ_CTX 12
+# define SEQ_CTX 12 // -s5
+//# define SEQ_CTX 0
 #endif
 
 #ifndef MAX_SEQ
@@ -464,19 +465,18 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
 #define NSYM 256
 #define STEP 8
-// FIXME: a dedicated base encoder would be much faster here
 #include "htscodecs/c_simple_model.h"
 #undef NSYM
 #undef STEP
 
-// Why is NSYM 5 so much poorer than NSYM 4?
-// Do all those remainder probabilities really add up to be that significant?
-#undef MAX_FREQ
-#define MAX_FREQ 255
 #define NSYM 4
-#define STEP 1
-//#include "htscodecs/c_simple_model.h"
 #include "htscodecs/c_small_model.h"
+
+#undef NSYM
+#define NSYM 2
+#include "htscodecs/c_small_model.h"
+
+//#define BOTH_STRANDS
 
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
@@ -488,19 +488,19 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 
     const int msize = 1<<(2*ctx_size);
     const int mask = msize-1;
-
-    SMALL_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
     int i;
 
-    // Do histogram to get observed values.
-    // Then set m to max number of elements in histogram.
+    SMALL_MODEL(4,_) *seq_model = malloc(msize * sizeof(*seq_model));
     for (i = 0; i < msize; i++)
-	SMALL_MODEL(NSYM,_init)(&seq_model[i]);
+	SMALL_MODEL(4,_init)(&seq_model[i]);
 
-    SIMPLE_MODEL(256,_) run_len4;
-    SIMPLE_MODEL(256,_init)(&run_len4, 256);
-    SIMPLE_MODEL(256,_) run_lenN;
-    SIMPLE_MODEL(256,_init)(&run_lenN, 256);
+    SMALL_MODEL(2,_) state_model[3];
+    SIMPLE_MODEL(256,_) run_len[3];
+    for (i = 0; i < 3; i++) {
+	SMALL_MODEL(2,_init)(&state_model[i]);
+	SIMPLE_MODEL(256,_init)(&run_len[i], 256);
+    }
+
     SIMPLE_MODEL(256,_) literal;
     SIMPLE_MODEL(256,_init)(&literal, 256);
 
@@ -508,83 +508,123 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
     RC_SetOutput(&rc, (char *)out);
     RC_StartEncode(&rc);
 
-    int last, last2;
     /* Corresponds to a 12-mer word that doesn't occur in human genome. */
-    last  = 0x007616c7 & mask;
-    //last2 = (0x2c6b62ff >> (32 - 2*ctx)) & mask; // both strands mode
+    int last  = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+    int last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask; // both strands mode
+#endif
 
     int L[256];
     for (int i = 0; i < 256; i++)
 	L[i] = 4; // N
-    L['A'] = L['a'] = 0;
-    L['C'] = L['c'] = 1;
-    L['G'] = L['g'] = 2;
-    L['T'] = L['t'] = 3;
+    L['A'] = 0;
+    L['C'] = 1;
+    L['G'] = 2;
+    L['T'] = 3;
 
-    // TODO: add an escape mechanism for within ACGT.
-    // Like RLE it could be a count of ACGTs, followed by a
-    // count of non-ACGTs and a different simpler model.
-#if NSYM>4
-    for (int i = 0; i < in_size; i++) {
-	unsigned char b = L[in[i]];
-	SMALL_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
-	last = ((last<<2) + b) & mask;
-    }
-#else
+    L['a'] = 0x80;
+    L['c'] = 0x81;
+    L['g'] = 0x82;
+    L['t'] = 0x83;
+
+    // Transition table to stored code:
+    //    uc lc N
+    // uc -  0  1
+    // lc 0  -  1
+    // N  0  1  -
+    enum { uc_ACGT = 0, lc_ACGT = 1, other = 2 } state = uc_ACGT;
+
     for (int i = 0; i < in_size; ) {//i++) {
-	// ACGT symbols
-	int j;
-	for (j = i; j < in_size; j++) {
-	    if (L[in[j]] == 4)
-		break;
+	// Count size of consecutive symbols matching the same state
+	int j, run, r2;
+	switch (state) {
+	case uc_ACGT: // uppercase ACGT symbols
+	    for (j = i; j < in_size; j++) {
+		if (L[in[j]] >= 4)
+		    break;
+	    }
+	    break;
+
+	case lc_ACGT: // lowercase acgt symbols
+	    for (j = i; j < in_size; j++) {
+		if (L[in[j]] < 0x80)
+		    break;
+	    }
+	    break;
+
+	case other: // ambiguity codes
+	    for (j = i; j < in_size; j++) {
+		if (L[in[j]] != 4)
+		    break;
+	    }
+	    break;
 	}
-	int run = j-i, r2 = run;
+
+	// Encode the run length
+	r2 = run = j-i;
 	for (;;) {
-	    SIMPLE_MODEL(256, _encodeSymbol)(&run_len4, &rc, MIN(255, r2));
-	    //fprintf(stderr, "run4 %d\n", MIN(255, r2));
+	    //fprintf(stderr, "Encode %d of %d for state %d\n",
+	    //    MIN(255, r2), run, state);
+	    SIMPLE_MODEL(256, _encodeSymbol)(&run_len[state], &rc,
+					     MIN(255, r2));
 	    if (r2 >= 255)
 		r2 -= 255;
 	    else
 		break;
 	}
 
-	for (j = 0; j < run; j++) {
-	    unsigned char b = L[in[i+j]];
-	    SMALL_MODEL(NSYM, _encodeSymbol)(&seq_model[last], &rc, b);
-	    last = ((last<<2) + b) & mask;
-	    _mm_prefetch((const char *)&seq_model[(last<<4)&mask], _MM_HINT_T0);
+	// Encode the symbols
+	switch (state) {
+	case uc_ACGT:
+	case lc_ACGT:
+	    for (j = 0; j < run; j++) {
+		unsigned char b = L[in[i+j]] & 3;
+		SMALL_MODEL(4, _encodeSymbol)(&seq_model[last], &rc, b);
+		last = ((last<<2) + b) & mask;
+		_mm_prefetch((const char *)&seq_model[(last<<4)&mask],
+			     _MM_HINT_T0);
 
-//	    if (1) { // both strands
-//		int b2 = last2 & 3;
-//		last2 = last2/4 + ((3-b) << (2*NS-2));
-//		_mm_prefetch((const char *)&model_seq8[last2], _MM_HINT_T0);
-//		SIMPLE_MODEL(NSYM, _updateSymbol)(b2);
-//	    }
+		// 0.7% and 3.2% smaller for _.FQ and _.fq respectively (at ctx_size 12),
+		// but 45% more CPU for seq encoding.
+#ifdef BOTH_STRANDS
+		int b2 = last2 & 3;
+		last2 = last2/4 + ((3-b) << (2*ctx_size-2));
+		// Can't predict prefetch for other end.
+		//_mm_prefetch((const char *)&seq_model[last2], _MM_HINT_T0);
+		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
+#endif
+	    }
+	    break;
+
+	case other:
+	    for (j = 0; j < run; j++)
+		SIMPLE_MODEL(256, _encodeSymbol)(&literal, &rc, in[i+j]);
 	}
+
 	i += run;
 	if (i >= in_size)
 	    break;
 
-	// non-ACGT symbols
-	for (j = i; j < in_size; j++) {
-	    if (L[in[j]] != 4)
-		break;
+	// Encode switch to next state
+	switch(L[in[i]]) {
+	case 0: case 1: case 2: case 3:
+	    //fprintf(stderr, "state %d to 0, => 0\n", state);
+	    SMALL_MODEL(2, _encodeSymbol)(&state_model[state], &rc, 0);
+	    state = uc_ACGT;
+	    break;
+	case 0x80: case 0x81: case 0x82: case 0x83:
+	    //fprintf(stderr, "state %d to 1, => %d\n", state, state==other);
+	    SMALL_MODEL(2, _encodeSymbol)(&state_model[state], &rc,
+					  state == other);
+	    state = lc_ACGT;
+	    break;
+	default:
+	    //fprintf(stderr, "state %d to 2, => 1\n", state);
+	    SMALL_MODEL(2, _encodeSymbol)(&state_model[state], &rc, 1);
+	    state = other;
+	    break;
 	}
-	run = j-i; r2 = run;
-	for (;;) {
-	    SIMPLE_MODEL(256, _encodeSymbol)(&run_lenN, &rc, MIN(255, r2));
-	    //fprintf(stderr, "runN %d\n", MIN(255, r2));
-	    if (r2 >= 255)
-		r2 -= 255;
-	    else
-		break;
-	}
-
-	for (j = 0; j < run; j++)
-	    SIMPLE_MODEL(256, _encodeSymbol)(&literal, &rc, in[i+j]);
-	i += run;
     }
-#endif
 
     RC_FinishEncode(&rc);
     *out_size = RC_OutSize(&rc);
@@ -603,19 +643,22 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 
     const int msize = 1<<(2*ctx_size);
     const int mask = msize-1;
-
-    SMALL_MODEL(NSYM,_) *seq_model = malloc(msize * sizeof(*seq_model));
     int i;
+
+    SMALL_MODEL(4,_) *seq_model = malloc(msize * sizeof(*seq_model));
 
     // Do histogram to get observed values.
     // Then set m to max number of elements in histogram.
     for (i = 0; i < msize; i++)
-	SMALL_MODEL(NSYM,_init)(&seq_model[i]);
+	SMALL_MODEL(4,_init)(&seq_model[i]);
 
-    SIMPLE_MODEL(256,_) run_len4;
-    SIMPLE_MODEL(256,_init)(&run_len4, 256);
-    SIMPLE_MODEL(256,_) run_lenN;
-    SIMPLE_MODEL(256,_init)(&run_lenN, 256);
+    SMALL_MODEL(2,_) state_model[3];
+    SIMPLE_MODEL(256,_) run_len[3];
+    for (i = 0; i < 3; i++) {
+	SMALL_MODEL(2,_init)(&state_model[i]);
+	SIMPLE_MODEL(256,_init)(&run_len[i], 256);
+    }
+
     SIMPLE_MODEL(256,_) literal;
     SIMPLE_MODEL(256,_init)(&literal, 256);
 
@@ -623,56 +666,78 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
     RC_SetInput(&rc, in, in+in_size);
     RC_StartDecode(&rc);
 
-    int last, last2;
     /* Corresponds to a 12-mer word that doesn't occur in human genome. */
-    last  = 0x007616c7 & mask;
-    //last2 = (0x2c6b62ff >> (32 - 2*ctx)) & mask; // both strands mode
+    int last  = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+    int last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask; // both strands mode
+#endif
 
-    // TODO: add an escape mechanism for within ACGT.
-    // Like RLE it could be a count of ACGTs, followed by a
-    // count of non-ACGTs and a different simpler model.
-#if NSYM<=4
+    // Transition table to stored code:
+    //    uc lc N
+    // uc -  0  1
+    // lc 0  -  1
+    // N  0  1  -
+    enum { uc_ACGT = 0, lc_ACGT = 1, other = 2 } state = uc_ACGT;
+
     for (int i = 0; i < out_size;) {
-	// ACGTs
-	int run = 0, r2, j;
+	int j, run = 0, r2;
+	// Fetch run length
 	do {
-	    r2 = SIMPLE_MODEL(256, _decodeSymbol)(&run_len4, &rc);
-	    //fprintf(stderr, "run4 %d\n", r2);
+	    r2 = SIMPLE_MODEL(256, _decodeSymbol)(&run_len[state], &rc);
 	    run += r2;
+	    //fprintf(stderr, "Decode %d of %d for state %d\n", r2, run, state);
 	} while (r2 == 255);
 
-	for (j = 0; j < run; j++) {
-	    unsigned char b =
-		SMALL_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
-	    last = ((last<<2) + b) & mask;
-	    // seq_model is 4 bytes, so can prefetch all 4 upcoing combinations
-	    _mm_prefetch((const char *)&seq_model[(last<<4)&mask], _MM_HINT_T0);
-	    out[i+j] = "ACGT"[b];
+	if (i + run > out_size)
+	    // or error as it's malformed data
+	    run = out_size - i;
+
+	// Decode
+	switch (state) {
+	case uc_ACGT:
+	case lc_ACGT: {
+	    char *bases = state==lc_ACGT ? "acgt" : "ACGT";
+	    for (j = 0; j < run; j++) {
+		unsigned char b =
+		    SMALL_MODEL(4, _decodeSymbol)(&seq_model[last], &rc);
+		last = ((last<<2) + b) & mask;
+		_mm_prefetch((const char *)&seq_model[(last<<4)&mask],
+			     _MM_HINT_T0);
+		out[i+j] = bases[b];
+
+#ifdef BOTH_STRANDS
+		int b2 = last2 & 3;
+		last2 = last2/4 + ((3-b) << (2*ctx_size-2));
+		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
+#endif
+	    }
+	    break;
 	}
+
+	case other: // ambiguity codes
+	    for (j = 0; j < run; j++)
+		out[i+j] = SIMPLE_MODEL(256, _decodeSymbol)(&literal, &rc);
+	    break;
+	}
+
 	i += run;
 	if (i >= out_size)
 	    break;
 
-	// non ACGT
-	run = 0;
-	do {
-	    r2 = SIMPLE_MODEL(256, _decodeSymbol)(&run_lenN, &rc);
-	    //fprintf(stderr, "runN %d\n", r2);
-	    run += r2;
-	} while (r2 == 255);
-
-	for (j = 0; j < run; j++)
-	    out[i+j] = SIMPLE_MODEL(256, _decodeSymbol)(&literal, &rc);
-	i += run;
+	// Next state
+	int nstate = SMALL_MODEL(2, _decodeSymbol)(&state_model[state], &rc);
+	switch (state) {
+	case uc_ACGT:
+	    state = nstate ? other : lc_ACGT;
+	    break;
+	case lc_ACGT:
+	    state = nstate ? other : uc_ACGT;
+	    break;
+	case other:
+	    state = nstate ? lc_ACGT : uc_ACGT;
+	    break;
+	}
     }
-#else
-    for (int i = 0; i < out_size; i++) {
-	unsigned char b =
-	    SMALL_MODEL(NSYM, _decodeSymbol)(&seq_model[last], &rc);
-	last = ((last<<2) + b) & mask;
-	out[i] = "ACGTN"[b];
-    }
-#endif
 
     RC_FinishDecode(&rc);
 
