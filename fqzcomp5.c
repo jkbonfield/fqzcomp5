@@ -2,14 +2,14 @@
 // - Tokenise name with different alphabets.
 //   See ~/scratch/data/enano_vir/ERR2708432.fastq
 
+// - Split aux tags into own data series using CRAM's TL + per tag.
+
+// - Seq encoding using STR + copy-number?
+//   May work well for ONT/PacBio where run len varies.
+
 // - Also permit old name encoding (fqzcomp -n1).
 //   Better on above data. Why?
 //   (fqz -n1: 912989, -n2: 1340223, paq8: 891928
-
-// - Separate name vs comment field encoding.
-
-// - Fqzcomp_qual for sequences
-//   Or optional bi-stranded analysis
 
 // - Removal of lengths from fqzqual stream
 
@@ -77,18 +77,17 @@
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/varint.h"
 
-#ifndef MAX_REC
-#define MAX_REC 1000000
-#endif
-
 #ifndef SEQ_CTX
 # define SEQ_CTX 12 // -s5
+//# define SEQ_CTX 14 // -s7
 //# define SEQ_CTX 0
 #endif
+//#define BOTH_STRANDS
 
-#ifndef MAX_SEQ
-#  define MAX_SEQ 100000
-#endif
+//#define BLK_SIZE 512*1000000
+//#define BLK_SIZE 300*1000000
+#define BLK_SIZE 100*1000000
+//#define BLK_SIZE 10*1000000
 
 #ifndef MIN
 #  define MIN(a,b) ((a)<(b)?(a):(b))
@@ -476,8 +475,6 @@ int fqz_manual_parameters(fqz_gparams *gp,
 #define NSYM 2
 #include "htscodecs/c_small_model.h"
 
-//#define BOTH_STRANDS
-
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
 		 int ctx_size,
@@ -747,9 +744,6 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 }
 
 
-#define BLK_SIZE 300*1000000
-//#define BLK_SIZE 10*1000000
-
 int main(int argc, char **argv) {
     unsigned char *in, *out, *seq;
     size_t in_len, out_len, seq_len;
@@ -814,6 +808,11 @@ int main(int argc, char **argv) {
 
     // Block based, for arbitrary sizes of input
     int64_t ntime = 0, stime = 0, qtime = 0;
+    size_t nusize = 0, ncsize = 0;
+    size_t lusize = 0, lcsize = 0;
+    size_t susize = 0, scsize = 0;
+    size_t qusize = 0, qcsize = 0;
+    size_t osize = 0;
     struct timeval tv1, tv2;
     if (decomp) {
 	for (;;) {
@@ -963,14 +962,16 @@ int main(int argc, char **argv) {
 
     } else {
 	// Load the next batch of fastq entries
+	int verbose = 0;
 	for(;;) {
 	    fastq *fq = load_seqs(in_fp, blk_size);
 	    if (!fq)
 		exit(1);
 
 	    // FIXME: report actual block size consumed?
-	    fprintf(stderr, "blk_size = %d, nrec = %d\n",
-		    blk_size, fq->num_records);
+	    if (verbose)
+		fprintf(stderr, "blk_size = %d, nrec = %d\n",
+			blk_size, fq->num_records);
 	    if (!fq->num_records) {
 		fastq_free(fq);
 		break;
@@ -990,8 +991,12 @@ int main(int argc, char **argv) {
 	    fwrite(&fq->name_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
+	    osize += 9;
 	    free(out);
-	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+	    if (verbose)
+		fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+	    nusize += fq->name_len;
+	    ncsize += clen;
 	    gettimeofday(&tv2, NULL);
 	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    ntime += tv2.tv_usec - tv1.tv_usec;
@@ -1003,8 +1008,12 @@ int main(int argc, char **argv) {
 		char buf[5], nb = 1;
 		nb += var_put_u32(buf+1, NULL, fq->fixed_len);
 		buf[0] = nb-1;
+		osize += 0;
+		lusize += 4*fq->num_records;
+		lcsize += nb;
 		fwrite(buf, 1, nb, out_fp);
-		fprintf(stderr, "Len:   %10d to %10d\n", 4*fq->num_records, nb);
+		if (verbose)
+		    fprintf(stderr, "Len:   %10d to %10d\n", 4*fq->num_records, nb);
 	    } else {
 		// Variable length (next byte 0), with 4 byte len followed
 		// by var-int lengths.
@@ -1015,10 +1024,14 @@ int main(int argc, char **argv) {
 		for (i = 0; i < fq->num_records; i++)
 		    nb += var_put_u32(buf+nb, NULL, fq->len[i]);
 		fwrite(&nb, 1, 4, out_fp);
+		osize += 0;
+		lusize += fq->num_records*4;
+		lcsize += nb+5;
 		fwrite(buf, 1, nb, out_fp);
 		free(buf);
-		fprintf(stderr, "Len:   %10d to %10d\n",
-			4*fq->num_records, nb+5);
+		if (verbose)
+		    fprintf(stderr, "Len:   %10d to %10d\n",
+			    4*fq->num_records, nb+5);
 	    }
 
 	    //----------
@@ -1029,6 +1042,7 @@ int main(int argc, char **argv) {
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
+	    osize += 9;
 	    free(out);
 #else
 	    // FIXME: test 197, 65 and 1
@@ -1039,9 +1053,13 @@ int main(int argc, char **argv) {
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
+	    osize += 9;
 	    free(out);
 #endif
-	    fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
+	    if (verbose)
+		fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
+	    susize += fq->seq_len;
+	    scsize += clen;
 	    gettimeofday(&tv2, NULL);
 	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    stime += tv2.tv_usec - tv1.tv_usec;
@@ -1081,8 +1099,14 @@ int main(int argc, char **argv) {
 	    fwrite(&fq->qual_len, 1, 4, out_fp);
 	    fwrite(&out_len, 1, 4, out_fp);
 	    fwrite(out, 1, out_len, out_fp);
+	    osize += 9;
 	    free(out);
-	    fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
+
+	    if (verbose)
+		fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
+	    qusize += fq->qual_len;
+	    qcsize += out_len;
+
 	    gettimeofday(&tv2, NULL);
 	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    qtime += tv2.tv_usec - tv1.tv_usec;
@@ -1090,9 +1114,15 @@ int main(int argc, char **argv) {
 	    fastq_free(fq);
 	}
     }
-    fprintf(stderr, "name time: %ld usec\n", ntime);
-    fprintf(stderr, "seq  time: %ld usec\n", stime);
-    fprintf(stderr, "qual time: %ld usec\n", qtime);
+
+    fprintf(stderr, "Name:    %10ld to %10ld in %ld usec\n",
+	    nusize, ncsize, ntime);
+    fprintf(stderr, "Length:  %10ld to %10ld\n", lusize, lcsize);
+    fprintf(stderr, "Seq:     %10ld to %10ld in %ld usec\n", 
+	    susize, scsize, stime);
+    fprintf(stderr, "Qual:    %10ld to %10ld in %ld usec\n", 
+	    qusize, qcsize, qtime);
+    fprintf(stderr, "Other:   %10ld\n", osize);
 
     fclose(in_fp);
     fclose(out_fp);
