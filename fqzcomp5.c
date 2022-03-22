@@ -79,6 +79,7 @@
 
 #ifndef SEQ_CTX
 # define SEQ_CTX 12 // -s5
+//# define SEQ_CTX 8
 //# define SEQ_CTX 14 // -s7
 //# define SEQ_CTX 0
 #endif
@@ -488,8 +489,11 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
     int i;
 
     SMALL_MODEL(4,_) *seq_model = malloc(msize * sizeof(*seq_model));
-    for (i = 0; i < msize; i++)
+//    SMALL_MODEL(4,_) *hom_len = malloc(msize * sizeof(*hom_len));
+    for (i = 0; i < msize; i++) {
 	SMALL_MODEL(4,_init)(&seq_model[i]);
+//	SMALL_MODEL(4,_init)(&hom_len[i]);
+    }
 
     SMALL_MODEL(2,_) state_model[3];
     SIMPLE_MODEL(256,_) run_len[3];
@@ -573,12 +577,48 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 	}
 
 	// Encode the symbols
+	int rep_len = 0;
+	int last_base = 99;
+	int last_base2 = 98;
 	switch (state) {
 	case uc_ACGT:
 	case lc_ACGT:
 	    for (j = 0; j < run; j++) {
+#if 0
+		// Encode GAAAT as G0 A3 T0
+		int k;
+		for (k = j+1; k < run; k++) {
+		    if (in[i+k] != in[i+j])
+			break;
+		}
+		int r2 = k-j-1;
+		//int rctx = ((last & 0x3ff)<<4);
+		int rctx = last & (mask>>2);
+		int n = 0;
+		do {
+		    SMALL_MODEL(4,_encodeSymbol)(&hom_len[rctx & 0xfff], &rc,
+						 MIN(3,r2));
+		    rctx = (rctx & (mask>>2)) | (n<<(2*ctx_size-2));
+		    r2 -= 3;
+		    n+=(n<3);
+		} while(r2 >= 0);
+ 		j = k-1;
+#endif
+
+// Use previous repeat length as part of seq context.
+// Also poor (but not as bad as above)
+//		rep_len = (last_base == last_base2)
+//		    ? rep_len+(rep_len<3)
+//		    : 0;
+//		last_base2 = last_base;
+//		last_base = in[i+j];
+//		unsigned char b = L[in[i+j]] & 3;
+//		int ctx = (last&(mask>>2)) | (rep_len<<(2*ctx_size-2));
+//		SMALL_MODEL(4, _encodeSymbol)(&seq_model[ctx], &rc, b);
+
 		unsigned char b = L[in[i+j]] & 3;
 		SMALL_MODEL(4, _encodeSymbol)(&seq_model[last], &rc, b);
+
 		last = ((last<<2) + b) & mask;
 		_mm_prefetch((const char *)&seq_model[(last<<4)&mask],
 			     _MM_HINT_T0);
