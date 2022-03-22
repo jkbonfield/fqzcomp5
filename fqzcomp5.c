@@ -83,7 +83,6 @@
 //# define SEQ_CTX 14 // -s7
 //# define SEQ_CTX 0
 #endif
-//#define BOTH_STRANDS
 
 //#define BLK_SIZE 512*1000000
 //#define BLK_SIZE 300*1000000
@@ -478,7 +477,7 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
-		 int *len, int ctx_size,
+		 int *len, int both_strands, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int *out_size) {
     char *out = malloc(in_size + 100);
     if (!out)
@@ -511,9 +510,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 
     /* Corresponds to a 12-mer word that doesn't occur in human genome. */
     int last  = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
     int last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask; // both strands mode
-#endif
 
     int L[256];
     for (int i = 0; i < 256; i++)
@@ -625,13 +622,13 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 
 		// 0.7% and 3.2% smaller for _.FQ and _.fq respectively (at ctx_size 12),
 		// but 45% more CPU for seq encoding.
-#ifdef BOTH_STRANDS
-		int b2 = last2 & 3;
-		last2 = last2/4 + ((3-b) << (2*ctx_size-2));
-		// Can't predict prefetch for other end.
-		//_mm_prefetch((const char *)&seq_model[last2], _MM_HINT_T0);
-		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
-#endif
+		if (both_strands) {
+		    int b2 = last2 & 3;
+		    last2 = last2/4 + ((3-b) << (2*ctx_size-2));
+		    // Can't predict prefetch for other end.
+		    //_mm_prefetch((const char *)&seq_model[last2], _MM_HINT_T0);
+		    SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
+		}
 
 		// In theory we should reset context for each new sequence
 		// as there is no obvious correlation between one sequence
@@ -645,9 +642,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		if (--seq_len == 0) {
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
-#endif
 		}
 	    }
 	    break;
@@ -658,9 +653,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		if (--seq_len == 0) {
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
-#endif
 		}
 	    }
 	}
@@ -699,7 +692,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 }
 
 char *decode_seq(unsigned char *in,  unsigned int in_size,
-		 int *len, int ctx_size,
+		 int *len, int both_strands, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int out_size) {
     char *out = malloc(out_size);
     if (!out)
@@ -732,9 +725,7 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 
     /* Corresponds to a 12-mer word that doesn't occur in human genome. */
     int last  = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
     int last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask; // both strands mode
-#endif
 
     // Transition table to stored code:
     //    uc lc N
@@ -771,18 +762,16 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 			     _MM_HINT_T0);
 		out[i+j] = bases[b];
 
-#ifdef BOTH_STRANDS
-		int b2 = last2 & 3;
-		last2 = last2/4 + ((3-b) << (2*ctx_size-2));
-		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
-#endif
+		if (both_strands) {
+		    int b2 = last2 & 3;
+		    last2 = last2/4 + ((3-b) << (2*ctx_size-2));
+		    SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
+	        }
 
 		if (--seq_len == 0) {
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
-#endif
 		}
 	    }
 	    break;
@@ -794,9 +783,7 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 		if (--seq_len == 0) {
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
-#ifdef BOTH_STRANDS
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
-#endif
 		}
 	    }
 	    break;
@@ -834,6 +821,8 @@ int main(int argc, char **argv) {
     size_t in_len, out_len, seq_len;
     int decomp = 0, vers = 4;  // CRAM version 4.0 (4) or 3.1 (3)
     int strat = 0, raw = 0;
+    int both_strands = 0;
+    int seq_ctx = 12;
     fqz_gparams *gp = NULL, gp_local;
     int blk_size = BLK_SIZE; // MAX
     FILE *in_fp, *out_fp;
@@ -847,10 +836,22 @@ int main(int argc, char **argv) {
     extern int optind;
     int opt;
 
-    while ((opt = getopt(argc, argv, "ds:s:b:rx:")) != -1) {
+    while ((opt = getopt(argc, argv, "ds:s:b:rx:BS:")) != -1) {
 	switch (opt) {
 	case 'd':
 	    decomp = 1;
+	    break;
+
+	case 'B':
+	    both_strands=1;
+	    break;
+
+	case 'S':
+	    seq_ctx = atoi(optarg);
+	    if (seq_ctx < 0)
+		seq_ctx = 0;
+	    if (seq_ctx > 16)
+		seq_ctx = 16;
 	    break;
 
 	case 'b':
@@ -969,6 +970,9 @@ int main(int argc, char **argv) {
 
 	    // ----------
 	    // Seq
+	    if ((c = getc(in_fp)) == EOF) break;
+	    seq_ctx = c & 0xf;
+	    both_strands = c >> 4;
 	    if (fread(&u_len, 1, 4, in_fp) != 4)
 		break;
 	    if (fread(&c_len, 1, 4, in_fp) != 4)
@@ -978,7 +982,7 @@ int main(int argc, char **argv) {
 		break;
 	    gettimeofday(&tv1, NULL);
 #if 1
-	    out = decode_seq(comp, c_len, fq->len, SEQ_CTX, u_len);
+	    out = decode_seq(comp, c_len, fq->len, both_strands, seq_ctx, u_len);
 #else
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
 #endif
@@ -1133,7 +1137,9 @@ int main(int argc, char **argv) {
 	    // Seq: rans or statistical modelling
 	    gettimeofday(&tv1, NULL);
 #if 1
-	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len, SEQ_CTX, &clen);
+	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len,
+			     both_strands, seq_ctx, &clen);
+	    putc(seq_ctx | (both_strands<<4), out_fp);
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
