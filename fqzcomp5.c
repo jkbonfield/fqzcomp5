@@ -477,7 +477,7 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
-		 int ctx_size,
+		 int *len, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int *out_size) {
     char *out = malloc(in_size + 100);
     if (!out)
@@ -531,6 +531,8 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
     // N  0  1  -
     enum { uc_ACGT = 0, lc_ACGT = 1, other = 2 } state = uc_ACGT;
 
+    int nseq = 0;
+    int seq_len = len[nseq++];
     for (int i = 0; i < in_size; ) {//i++) {
 	// Count size of consecutive symbols matching the same state
 	int j, run, r2;
@@ -590,12 +592,37 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		//_mm_prefetch((const char *)&seq_model[last2], _MM_HINT_T0);
 		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
 #endif
+
+		// In theory we should reset context for each new sequence
+		// as there is no obvious correlation between one sequence
+		// and the next.  In practice the difference is 1-2%.
+		// It only costs 1-2% CPU too, so worth doing.
+		//
+		//          -s5/100MB             -s7 -b / 512MB
+		// Without: 76655812              60731188
+		// With:    75789505 -1.1%        59638082 -1.8%
+		// Slowdown 0.2%                  1.9%
+		if (--seq_len == 0) {
+		    seq_len = len[nseq++];
+		    last = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
+#endif
+		}
 	    }
 	    break;
 
 	case other:
-	    for (j = 0; j < run; j++)
+	    for (j = 0; j < run; j++) {
 		SIMPLE_MODEL(256, _encodeSymbol)(&literal, &rc, in[i+j]);
+		if (--seq_len == 0) {
+		    seq_len = len[nseq++];
+		    last = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
+#endif
+		}
+	    }
 	}
 
 	i += run;
@@ -632,7 +659,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 }
 
 char *decode_seq(unsigned char *in,  unsigned int in_size,
-		 int ctx_size,
+		 int *len, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int out_size) {
     char *out = malloc(out_size);
     if (!out)
@@ -676,6 +703,8 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
     // N  0  1  -
     enum { uc_ACGT = 0, lc_ACGT = 1, other = 2 } state = uc_ACGT;
 
+    int nseq = 0;
+    int seq_len = len[nseq++];
     for (int i = 0; i < out_size;) {
 	int j, run = 0, r2;
 	// Fetch run length
@@ -707,13 +736,29 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 		last2 = last2/4 + ((3-b) << (2*ctx_size-2));
 		SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
 #endif
+
+		if (--seq_len == 0) {
+		    seq_len = len[nseq++];
+		    last = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
+#endif
+		}
 	    }
 	    break;
 	}
 
 	case other: // ambiguity codes
-	    for (j = 0; j < run; j++)
+	    for (j = 0; j < run; j++) {
 		out[i+j] = SIMPLE_MODEL(256, _decodeSymbol)(&literal, &rc);
+		if (--seq_len == 0) {
+		    seq_len = len[nseq++];
+		    last = 0x007616c7 & mask;
+#ifdef BOTH_STRANDS
+		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
+#endif
+		}
+	    }
 	    break;
 	}
 
@@ -840,6 +885,8 @@ int main(int argc, char **argv) {
 	    fq->name_len = u_len;
 	    free(comp);
 	    gettimeofday(&tv2, NULL);
+	    ncsize += u_len;
+	    nusize += c_len;
 	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    ntime += tv2.tv_usec - tv1.tv_usec;
 
@@ -855,6 +902,8 @@ int main(int argc, char **argv) {
 		err |= var_get_u32(buf, buf+c, &len) == 0;
 		for (i = 0; i < nr; i++)
 		    fq->len[i] = len;
+		lcsize += nr*4;
+		lusize += c+4;
 	    } else {
 		// Variable length
 		uint32_t blen;
@@ -872,6 +921,8 @@ int main(int argc, char **argv) {
 		if (nb != blen)
 		    break;
 		free(buf);
+		lcsize += nr*4;
+		lusize += blen+4;
 	    }
 	    if (err)
 		break;
@@ -887,7 +938,7 @@ int main(int argc, char **argv) {
 		break;
 	    gettimeofday(&tv1, NULL);
 #if 1
-	    out = decode_seq(comp, c_len, SEQ_CTX, u_len);
+	    out = decode_seq(comp, c_len, fq->len, SEQ_CTX, u_len);
 #else
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
 #endif
@@ -899,6 +950,8 @@ int main(int argc, char **argv) {
 	    gettimeofday(&tv2, NULL);
 	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    stime += tv2.tv_usec - tv1.tv_usec;
+	    scsize += u_len;
+	    susize += c_len;
 
 	    // ----------
 	    // Qual
@@ -942,6 +995,8 @@ int main(int argc, char **argv) {
 	    gettimeofday(&tv2, NULL);
 	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
 	    qtime += tv2.tv_usec - tv1.tv_usec;
+	    qcsize += out_len;
+	    qusize += c_len;
 
 	    // ----------
 	    // Convert back to fastq
@@ -1038,7 +1093,7 @@ int main(int argc, char **argv) {
 	    // Seq: rans or statistical modelling
 	    gettimeofday(&tv1, NULL);
 #if 1
-	    out = encode_seq(fq->seq_buf, fq->seq_len, SEQ_CTX, &clen);
+	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len, SEQ_CTX, &clen);
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
 	    fwrite(out, 1, clen, out_fp);
