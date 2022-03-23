@@ -77,17 +77,7 @@
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/varint.h"
 
-#ifndef SEQ_CTX
-# define SEQ_CTX 12 // -s5
-//# define SEQ_CTX 8
-//# define SEQ_CTX 14 // -s7
-//# define SEQ_CTX 0
-#endif
-
-//#define BLK_SIZE 512*1000000
-//#define BLK_SIZE 300*1000000
-#define BLK_SIZE 100*1000000
-//#define BLK_SIZE 10*1000000
+#define BLK_SIZE 512*1000000
 
 #ifndef MIN
 #  define MIN(a,b) ((a)<(b)?(a):(b))
@@ -815,17 +805,370 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
     return out;
 }
 
+typedef struct {
+    int nstrat, sstrat, qstrat;
+    int nlevel, slevel, qlevel;
+    int verbose;
+    int both_strands;
+    int blk_size;
+} opts;
+
+typedef struct {
+    int64_t nusize, ncsize, ntime;
+    int64_t susize, scsize, stime;
+    int64_t qusize, qcsize, qtime;
+    int64_t lusize, lcsize, ltime;
+    int64_t osize;
+} timings;
+
+int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
+    unsigned char *out;
+    size_t out_len;
+    struct timeval tv1, tv2;
+    int c, err = 0;
+
+    for(;;) {
+	fastq *fq = load_seqs(in_fp, arg->blk_size);
+	if (!fq)
+	    return -1;
+
+	if (arg->verbose)
+	    fprintf(stderr, "Loaded nrec = %d\n", fq->num_records);
+	if (!fq->num_records) {
+	    fastq_free(fq);
+	    break;
+	}
+	//fastq_dump(fq);
+	    
+	fwrite(&fq->num_records, 1, 4, out_fp);
+
+	//----------
+	// Names: tok3
+	gettimeofday(&tv1, NULL);
+	int clen;
+
+	out = tok3_encode_names(fq->name_buf, fq->name_len, 7, 0,
+				&clen, NULL);
+	putc(0, out_fp); // name method
+	fwrite(&fq->name_len, 1, 4, out_fp);
+	fwrite(&clen, 1, 4, out_fp);
+	fwrite(out, 1, clen, out_fp);
+	t->osize += 9;
+	free(out);
+	if (arg->verbose)
+	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+	t->nusize += fq->name_len;
+	t->ncsize += clen;
+	gettimeofday(&tv2, NULL);
+	t->ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->ntime += tv2.tv_usec - tv1.tv_usec;
+
+	//----------
+	// Read lengths
+	if (fq->fixed_len) {
+	    // Fixed length, with next byte holding the size of length
+	    char buf[5], nb = 1;
+	    nb += var_put_u32(buf+1, NULL, fq->fixed_len);
+	    buf[0] = nb-1;
+	    t->osize += 0;
+	    t->lusize += 4*fq->num_records;
+	    t->lcsize += nb;
+	    fwrite(buf, 1, nb, out_fp);
+	    if (arg->verbose)
+		fprintf(stderr, "Len:   %10d to %10d\n", 4*fq->num_records, nb);
+	} else {
+	    // Variable length (next byte 0), with 4 byte len followed
+	    // by var-int lengths.
+	    int i, nb = 0;
+	    char *buf = malloc(fq->num_records*5);
+	    putc(0, out_fp);
+
+	    for (i = 0; i < fq->num_records; i++)
+		nb += var_put_u32(buf+nb, NULL, fq->len[i]);
+	    fwrite(&nb, 1, 4, out_fp);
+	    t->osize += 0;
+	    t->lusize += fq->num_records*4;
+	    t->lcsize += nb+5;
+	    fwrite(buf, 1, nb, out_fp);
+	    free(buf);
+	    if (arg->verbose)
+		fprintf(stderr, "Len:   %10d to %10d\n",
+			4*fq->num_records, nb+5);
+	}
+
+	//----------
+	// Seq: rans or statistical modelling
+	gettimeofday(&tv1, NULL);
+	if (arg->sstrat == 1) {
+	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len,
+			     arg->both_strands, arg->slevel, &clen);
+	    putc((arg->slevel<<4) | (arg->both_strands<<3) | 1, out_fp);
+	    fwrite(&fq->seq_len, 1, 4, out_fp);
+	    fwrite(&clen, 1, 4, out_fp);
+	    fwrite(out, 1, clen, out_fp);
+	    t->osize += 9;
+	} else {
+	    // FIXME: test 197, 65 and 1
+	    // FIXME: also try fqz for encoding, qmap and qshift=2.
+	    // But need extension to permit reverse complement.
+	    // Also not quite the same in terms of model updates?
+	    out = rans_compress_4x16(fq->seq_buf, fq->seq_len, &clen, 197);
+	    putc(0, out_fp); // seq method
+	    fwrite(&fq->seq_len, 1, 4, out_fp);
+	    fwrite(&clen, 1, 4, out_fp);
+	    fwrite(out, 1, clen, out_fp);
+	    t->osize += 9;
+	}
+	free(out);
+
+	if (arg->verbose)
+	    fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
+	t->susize += fq->seq_len;
+	t->scsize += clen;
+	gettimeofday(&tv2, NULL);
+	t->stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->stime += tv2.tv_usec - tv1.tv_usec;
+
+	//----------
+	// Qual: rans or fqz
+	// Convert fastq struct to fqz_slice for context
+	gettimeofday(&tv1, NULL);
+	if (arg->qstrat == 0) {
+	    // Fast mode
+	    putc(0, out_fp);
+	    out = rans_compress_4x16(fq->qual_buf, fq->seq_len,
+				     &clen, 193);
+	    // crash on /tmp/_1m4.fq with mode 197.  Why?
+	    out_len = clen;
+	} else {
+	    putc(1, out_fp);
+	    fqz_slice *s = malloc(fq->num_records * sizeof(*s));
+	    s->num_records = fq->num_records;
+	    s->len = fq->len;
+	    s->flags = fq->flag;
+	    s->seq = malloc(fq->num_records * sizeof(char *));
+	    int i, j;
+	    for (i = j = 0; i < fq->num_records; j += fq->len[i++])
+		s->seq[i] = fq->seq_buf + j;
+
+	    // FIXME: expose fqz_pick_parameters function so we
+	    // can initialise it here and then also turn off DO_LEN.
+
+	    // Concatenate qualities together into a single block.
+	    // FIXME: move qual down by 33, '!'.
+	    out = fqz_compress(4, s, fq->qual_buf, fq->qual_len,
+			       &out_len, arg->qlevel, gp);
+	    free(s->seq);
+	    free(s);
+	}
+	fwrite(&fq->qual_len, 1, 4, out_fp);
+	fwrite(&out_len, 1, 4, out_fp);
+	fwrite(out, 1, out_len, out_fp);
+	t->osize += 9;
+	free(out);
+
+	if (arg->verbose)
+	    fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
+	t->qusize += fq->qual_len;
+	t->qcsize += out_len;
+	gettimeofday(&tv2, NULL);
+	t->qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->qtime += tv2.tv_usec - tv1.tv_usec;
+
+	fastq_free(fq);
+    }
+
+    return 0;
+}
+
+int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
+    unsigned char *out;
+    size_t out_len;
+    struct timeval tv1, tv2;
+    int c, err = 0;
+
+    for (;;) {
+	// Load next compressed block
+	int i, j, nr, u_len, c_len;
+	char *comp;
+
+	if (fread(&nr, 1, 4, in_fp) != 4)
+	    break;
+	fastq *fq = fastq_alloc(nr);
+
+	// ----------
+	// Name
+	if ((c = getc(in_fp)) == EOF) break;
+	if (c != 0) return -1; // method
+	if (fread(&u_len, 1, 4, in_fp) != 4)
+	    break;
+	if (fread(&c_len, 1, 4, in_fp) != 4)
+	    break;
+	comp = malloc(c_len);
+	if (fread(comp, 1, c_len, in_fp) != c_len)
+	    break;
+
+	gettimeofday(&tv1, NULL);
+	out = tok3_decode_names(comp, c_len, &u_len);
+	fq->name_buf = out;
+	fq->name_len = u_len;
+	free(comp);
+	gettimeofday(&tv2, NULL);
+	t->ncsize += u_len;
+	t->nusize += c_len;
+	t->ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->ntime += tv2.tv_usec - tv1.tv_usec;
+
+	// ----------
+	// Lengths
+	if ((c = getc(in_fp)) == EOF) break;
+	if (c > 0) {
+	    // Fixed length
+	    char buf[10];
+	    err |= fread(buf, 1, c, in_fp) != c;
+	    uint32_t len;
+	    err |= var_get_u32(buf, buf+c, &len) == 0;
+	    for (i = 0; i < nr; i++)
+		fq->len[i] = len;
+	    t->lcsize += nr*4;
+	    t->lusize += c+4;
+	} else {
+	    // Variable length
+	    uint32_t blen;
+	    if (fread(&blen, 1, 4, in_fp) != 4)
+		break;
+	    char *buf = malloc(blen);
+	    err |= fread(buf, 1, blen, in_fp) != blen;
+	    int nb = 0;
+	    for (i = 0; i < nr; i++) {
+		int vl;
+		nb += (vl = var_get_u32(buf+nb, buf+blen, &fq->len[i]));
+		err |= vl == 0;
+		//fread(&fq->len[i], 1, 4, in_fp) != 4;
+	    }
+	    if (nb != blen)
+		break;
+	    free(buf);
+	    t->lcsize += nr*4;
+	    t->lusize += blen+4;
+	}
+	if (err)
+	    break;
+
+	// ----------
+	// Seq
+	if ((c = getc(in_fp)) == EOF) break;
+	arg->slevel = c>>4;
+	arg->both_strands = (c >> 3) & 1;
+	if (fread(&u_len, 1, 4, in_fp) != 4)
+	    break;
+	if (fread(&c_len, 1, 4, in_fp) != 4)
+	    break;
+	comp = malloc(c_len);
+	if (fread(comp, 1, c_len, in_fp) != c_len)
+	    break;
+	gettimeofday(&tv1, NULL);
+	if ((c & 7) == 1) {
+	    out = decode_seq(comp, c_len, fq->len,
+			     arg->both_strands, arg->slevel, u_len);
+	} else {
+	    out = rans_uncompress_4x16(comp, c_len, &u_len);
+	}
+	free(comp);
+	fq->seq_buf = out;
+	fq->seq_len = u_len;
+	for (i = 0; i < nr; i++)
+	    fq->seq[i] = i ? fq->seq[i-1] + fq->len[i-1] : 0;
+	gettimeofday(&tv2, NULL);
+	t->stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->stime += tv2.tv_usec - tv1.tv_usec;
+	t->scsize += u_len;
+	t->susize += c_len;
+
+	// ----------
+	// Qual
+	int mode = getc(in_fp);
+	if (fread(&u_len, 1, 4, in_fp) != 4)
+	    break;
+	if (fread(&c_len, 1, 4, in_fp) != 4)
+	    break;
+	comp = malloc(c_len);
+	if (fread(comp, 1, c_len, in_fp) != c_len)
+	    break;
+
+	gettimeofday(&tv1, NULL);
+	if (mode == 0) {
+	    // Rans
+	    out = rans_uncompress_4x16(comp, c_len, &u_len);
+	    fq->qual_buf = out;
+	    fq->qual_len = u_len;
+	} else {
+	    // FQZComp qual
+	    fqz_slice s;
+	    s.num_records = fq->num_records;
+	    s.len = fq->len;
+	    s.flags = fq->flag;
+	    //s.seq = (unsigned char **)fq->seq;
+	    s.seq = (unsigned char **)malloc(fq->num_records * sizeof(char *));
+	    for (i = j = 0; i < fq->num_records; j += fq->len[i++])
+		s.seq[i] = fq->seq_buf + j;
+
+	    int *lengths = malloc(nr * sizeof(lengths));
+	    out = fqz_decompress((char *)comp, c_len, &out_len,
+				 lengths, nr, &s);
+	    fq->qual_buf = out;
+	    fq->qual_len = out_len;
+	    free(s.seq);
+	    free(lengths);
+	}
+	free(comp);
+	for (i = 0; i < fq->qual_len; i++)
+	    fq->qual_buf[i] += 33;
+	gettimeofday(&tv2, NULL);
+	t->qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
+	t->qtime += tv2.tv_usec - tv1.tv_usec;
+	t->qcsize += out_len;
+	t->qusize += c_len;
+
+	// ----------
+	// Convert back to fastq
+	char *np = fq->name_buf;
+	char *sp = fq->seq_buf;
+	char *qp = fq->qual_buf;
+
+	for (i = 0; i < nr; i++) {
+	    fprintf(out_fp, "@%s\n%.*s\n+\n%.*s\n",
+		    np, fq->len[i], sp, fq->len[i], qp);
+	    np += strlen(np)+1;
+	    sp += fq->len[i];
+	    qp += fq->len[i];
+	}
+
+	fastq_free(fq);
+    }
+
+    return 0;
+}
 
 int main(int argc, char **argv) {
     unsigned char *in, *out, *seq;
     size_t in_len, out_len, seq_len;
     int decomp = 0, vers = 4;  // CRAM version 4.0 (4) or 3.1 (3)
-    int strat = 0, raw = 0;
-    int both_strands = 0;
-    int seq_ctx = 12;
     fqz_gparams *gp = NULL, gp_local;
-    int blk_size = BLK_SIZE; // MAX
     FILE *in_fp, *out_fp;
+    timings t = {0};
+
+    opts arg = {
+	.qstrat = 1, // 0=rans, 1=fqz
+	.qlevel = 0,
+	.sstrat = 1, // 0=rans, 1=fqz
+	.slevel = 12,
+	.nstrat = 1, // (0=rans), 1=tok3
+	.nlevel = 7,
+	.both_strands =0,
+	.verbose = 0,
+	.blk_size = BLK_SIZE,
+    };
 
 #ifdef _WIN32
         _setmode(_fileno(stdin),  _O_BINARY);
@@ -836,32 +1179,48 @@ int main(int argc, char **argv) {
     extern int optind;
     int opt;
 
-    while ((opt = getopt(argc, argv, "ds:s:b:rx:BS:")) != -1) {
+    while ((opt = getopt(argc, argv, "dQ:b:x:BS:vn:s:q:")) != -1) {
 	switch (opt) {
+	case 'v':
+	    arg.verbose++;
+	    break;
+
 	case 'd':
 	    decomp = 1;
 	    break;
 
 	case 'B':
-	    both_strands=1;
-	    break;
-
-	case 'S':
-	    seq_ctx = atoi(optarg);
-	    if (seq_ctx < 0)
-		seq_ctx = 0;
-	    if (seq_ctx > 16)
-		seq_ctx = 16;
-	    break;
-
-	case 'b':
-	    blk_size = atoi(optarg);
-	    if (blk_size > BLK_SIZE)
-		blk_size = BLK_SIZE;
+	    arg.both_strands=1;
 	    break;
 
 	case 's':
-	    strat = atoi(optarg);
+	    arg.sstrat = atoi(optarg);
+	    break;
+
+	case 'S':
+	    arg.slevel = atoi(optarg);
+	    if (arg.slevel < 0)
+		arg.slevel = 0;
+	    if (arg.slevel > 16)
+		arg.slevel = 16;
+	    break;
+
+	case 'n':
+	    arg.nstrat = atoi(optarg);
+	    break;
+
+	case 'q':
+	    arg.qstrat = atoi(optarg);
+	    break;
+
+	case 'Q':
+	    arg.qlevel = atoi(optarg);
+	    break;
+
+	case 'b':
+	    arg.blk_size = atoi(optarg);
+	    if (arg.blk_size > BLK_SIZE)
+		arg.blk_size = BLK_SIZE;
 	    break;
 
 	case 'x': {
@@ -881,9 +1240,6 @@ int main(int argc, char **argv) {
 	    gp = &gp_local;
 	    break;
 	}
-	case 'r':
-	    raw = 1;
-	    break;
 	}
     }
 
@@ -901,329 +1257,23 @@ int main(int argc, char **argv) {
     size_t osize = 0;
     struct timeval tv1, tv2;
     if (decomp) {
-	for (;;) {
-	    // Load next compressed block
-	    int i, j, nr, u_len, c_len;
-	    char *comp;
-
-	    if (fread(&nr, 1, 4, in_fp) != 4)
-		break;
-	    fastq *fq = fastq_alloc(nr);
-
-	    // ----------
-	    // Name
-	    if (fread(&u_len, 1, 4, in_fp) != 4)
-		break;
-	    if (fread(&c_len, 1, 4, in_fp) != 4)
-		break;
-	    comp = malloc(c_len);
-	    if (fread(comp, 1, c_len, in_fp) != c_len)
-		break;
-
-	    gettimeofday(&tv1, NULL);
-	    out = tok3_decode_names(comp, c_len, &u_len);
-	    fq->name_buf = out;
-	    fq->name_len = u_len;
-	    free(comp);
-	    gettimeofday(&tv2, NULL);
-	    ncsize += u_len;
-	    nusize += c_len;
-	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    ntime += tv2.tv_usec - tv1.tv_usec;
-
-	    // ----------
-	    // Lengths
-	    int c, err = 0;
-	    if ((c = getc(in_fp)) == EOF) break;
-	    if (c > 0) {
-		// Fixed length
-		char buf[10];
-		err |= fread(buf, 1, c, in_fp) != c;
-		uint32_t len;
-		err |= var_get_u32(buf, buf+c, &len) == 0;
-		for (i = 0; i < nr; i++)
-		    fq->len[i] = len;
-		lcsize += nr*4;
-		lusize += c+4;
-	    } else {
-		// Variable length
-		uint32_t blen;
-		if (fread(&blen, 1, 4, in_fp) != 4)
-		    break;
-		char *buf = malloc(blen);
-		err |= fread(buf, 1, blen, in_fp) != blen;
-		int nb = 0;
-		for (i = 0; i < nr; i++) {
-		    int vl;
-		    nb += (vl = var_get_u32(buf+nb, buf+blen, &fq->len[i]));
-		    err |= vl == 0;
-		    //fread(&fq->len[i], 1, 4, in_fp) != 4;
-		}
-		if (nb != blen)
-		    break;
-		free(buf);
-		lcsize += nr*4;
-		lusize += blen+4;
-	    }
-	    if (err)
-		break;
-
-	    // ----------
-	    // Seq
-	    if ((c = getc(in_fp)) == EOF) break;
-	    seq_ctx = c & 0xf;
-	    both_strands = c >> 4;
-	    if (fread(&u_len, 1, 4, in_fp) != 4)
-		break;
-	    if (fread(&c_len, 1, 4, in_fp) != 4)
-		break;
-	    comp = malloc(c_len);
-	    if (fread(comp, 1, c_len, in_fp) != c_len)
-		break;
-	    gettimeofday(&tv1, NULL);
-#if 1
-	    out = decode_seq(comp, c_len, fq->len, both_strands, seq_ctx, u_len);
-#else
-	    out = rans_uncompress_4x16(comp, c_len, &u_len);
-#endif
-	    free(comp);
-	    fq->seq_buf = out;
-	    fq->seq_len = u_len;
-	    for (i = 0; i < nr; i++)
-		fq->seq[i] = i ? fq->seq[i-1] + fq->len[i-1] : 0;
-	    gettimeofday(&tv2, NULL);
-	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    stime += tv2.tv_usec - tv1.tv_usec;
-	    scsize += u_len;
-	    susize += c_len;
-
-	    // ----------
-	    // Qual
-	    int mode = getc(in_fp);
-	    if (fread(&u_len, 1, 4, in_fp) != 4)
-		break;
-	    if (fread(&c_len, 1, 4, in_fp) != 4)
-		break;
-	    comp = malloc(c_len);
-	    if (fread(comp, 1, c_len, in_fp) != c_len)
-		break;
-
-	    gettimeofday(&tv1, NULL);
-	    if (mode == 0) {
-		// Rans
-		out = rans_uncompress_4x16(comp, c_len, &u_len);
-		fq->qual_buf = out;
-		fq->qual_len = u_len;
-	    } else {
-		// FQZComp qual
-		fqz_slice s;
-		s.num_records = fq->num_records;
-		s.len = fq->len;
-		s.flags = fq->flag;
-		//s.seq = (unsigned char **)fq->seq;
-		s.seq = (unsigned char **)malloc(fq->num_records * sizeof(char *));
-		for (i = j = 0; i < fq->num_records; j += fq->len[i++])
-		    s.seq[i] = fq->seq_buf + j;
-
-		int *lengths = malloc(nr * sizeof(lengths));
-		out = fqz_decompress((char *)comp, c_len, &out_len,
-				     lengths, nr, &s);
-		fq->qual_buf = out;
-		fq->qual_len = out_len;
-		free(s.seq);
-		free(lengths);
-	    }
-	    free(comp);
-	    for (i = 0; i < fq->qual_len; i++)
-		fq->qual_buf[i] += 33;
-	    gettimeofday(&tv2, NULL);
-	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    qtime += tv2.tv_usec - tv1.tv_usec;
-	    qcsize += out_len;
-	    qusize += c_len;
-
-	    // ----------
-	    // Convert back to fastq
-	    char *np = fq->name_buf;
-	    char *sp = fq->seq_buf;
-	    char *qp = fq->qual_buf;
-
-	    for (i = 0; i < nr; i++) {
-		fprintf(out_fp, "@%s\n%.*s\n+\n%.*s\n",
-			np, fq->len[i], sp, fq->len[i], qp);
-		np += strlen(np)+1;
-		sp += fq->len[i];
-		qp += fq->len[i];
-	    }
-
-	    fastq_free(fq);
-	}
-
+	if (decode(in_fp, out_fp, &arg, &t) < 0)
+	    exit(1);
     } else {
-	// Load the next batch of fastq entries
-	int verbose = 0;
-	for(;;) {
-	    fastq *fq = load_seqs(in_fp, blk_size);
-	    if (!fq)
-		exit(1);
-
-	    // FIXME: report actual block size consumed?
-	    if (verbose)
-		fprintf(stderr, "blk_size = %d, nrec = %d\n",
-			blk_size, fq->num_records);
-	    if (!fq->num_records) {
-		fastq_free(fq);
-		break;
-	    }
-
-	    //fastq_dump(fq);
-	    
-	    fwrite(&fq->num_records, 1, 4, out_fp);
-
-	    //----------
-	    // Names: tok3
-	    gettimeofday(&tv1, NULL);
-	    int clen;
-
-	    out = tok3_encode_names(fq->name_buf, fq->name_len, 7, 0,
-				    &clen, NULL);
-	    fwrite(&fq->name_len, 1, 4, out_fp);
-	    fwrite(&clen, 1, 4, out_fp);
-	    fwrite(out, 1, clen, out_fp);
-	    osize += 9;
-	    free(out);
-	    if (verbose)
-		fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
-	    nusize += fq->name_len;
-	    ncsize += clen;
-	    gettimeofday(&tv2, NULL);
-	    ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    ntime += tv2.tv_usec - tv1.tv_usec;
-
-	    //----------
-	    // Read lengths
-	    if (fq->fixed_len) {
-		// Fixed length, with next byte holding the size of length
-		char buf[5], nb = 1;
-		nb += var_put_u32(buf+1, NULL, fq->fixed_len);
-		buf[0] = nb-1;
-		osize += 0;
-		lusize += 4*fq->num_records;
-		lcsize += nb;
-		fwrite(buf, 1, nb, out_fp);
-		if (verbose)
-		    fprintf(stderr, "Len:   %10d to %10d\n", 4*fq->num_records, nb);
-	    } else {
-		// Variable length (next byte 0), with 4 byte len followed
-		// by var-int lengths.
-		int i, nb = 0;
-		char *buf = malloc(fq->num_records*5);
-		putc(0, out_fp);
-
-		for (i = 0; i < fq->num_records; i++)
-		    nb += var_put_u32(buf+nb, NULL, fq->len[i]);
-		fwrite(&nb, 1, 4, out_fp);
-		osize += 0;
-		lusize += fq->num_records*4;
-		lcsize += nb+5;
-		fwrite(buf, 1, nb, out_fp);
-		free(buf);
-		if (verbose)
-		    fprintf(stderr, "Len:   %10d to %10d\n",
-			    4*fq->num_records, nb+5);
-	    }
-
-	    //----------
-	    // Seq: rans or statistical modelling
-	    gettimeofday(&tv1, NULL);
-#if 1
-	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len,
-			     both_strands, seq_ctx, &clen);
-	    putc(seq_ctx | (both_strands<<4), out_fp);
-	    fwrite(&fq->seq_len, 1, 4, out_fp);
-	    fwrite(&clen, 1, 4, out_fp);
-	    fwrite(out, 1, clen, out_fp);
-	    osize += 9;
-	    free(out);
-#else
-	    // FIXME: test 197, 65 and 1
-	    // FIXME: also try fqz for encoding, qmap and qshift=2.
-	    // But need extension to permit reverse complement.
-	    // Also not quite the same in terms of model updates?
-	    out = rans_compress_4x16(fq->seq_buf, fq->seq_len, &clen, 197);
-	    fwrite(&fq->seq_len, 1, 4, out_fp);
-	    fwrite(&clen, 1, 4, out_fp);
-	    fwrite(out, 1, clen, out_fp);
-	    osize += 9;
-	    free(out);
-#endif
-	    if (verbose)
-		fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
-	    susize += fq->seq_len;
-	    scsize += clen;
-	    gettimeofday(&tv2, NULL);
-	    stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    stime += tv2.tv_usec - tv1.tv_usec;
-
-	    //----------
-	    // Qual: rans or fqz
-	    // Convert fastq struct to fqz_slice for context
-	    gettimeofday(&tv1, NULL);
-	    if (0) {
-		// Fast mode
-		putc(0, out_fp);
-		out = rans_compress_4x16(fq->qual_buf, fq->seq_len,
-					 &clen, 193);
-		// crash on /tmp/_1m4.fq with mode 197.  Why?
-		out_len = clen;
-	    } else {
-		putc(1, out_fp);
-		fqz_slice *s = malloc(fq->num_records * sizeof(*s));
-		s->num_records = fq->num_records;
-		s->len = fq->len;
-		s->flags = fq->flag;
-		s->seq = malloc(fq->num_records * sizeof(char *));
-		int i, j;
-		for (i = j = 0; i < fq->num_records; j += fq->len[i++])
-		    s->seq[i] = fq->seq_buf + j;
-
-		// FIXME: expose fqz_pick_parameters function so we
-		// can initialise it here and then also turn off DO_LEN.
-
-		// Concatenate qualities together into a single block.
-		// FIXME: move qual down by 33, '!'.
-		out = fqz_compress(vers, s, fq->qual_buf, fq->qual_len,
-				   &out_len, strat, gp);
-		free(s->seq);
-		free(s);
-	    }
-	    fwrite(&fq->qual_len, 1, 4, out_fp);
-	    fwrite(&out_len, 1, 4, out_fp);
-	    fwrite(out, 1, out_len, out_fp);
-	    osize += 9;
-	    free(out);
-
-	    if (verbose)
-		fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
-	    qusize += fq->qual_len;
-	    qcsize += out_len;
-
-	    gettimeofday(&tv2, NULL);
-	    qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-	    qtime += tv2.tv_usec - tv1.tv_usec;
-
-	    fastq_free(fq);
-	}
+	if (encode(in_fp, out_fp, gp, &arg, &t) < 0)
+	    exit(1);
     }
 
     fprintf(stderr, "Name:    %10ld to %10ld in %ld usec\n",
-	    nusize, ncsize, ntime);
-    fprintf(stderr, "Length:  %10ld to %10ld\n", lusize, lcsize);
+	    t.nusize, t.ncsize, t.ntime);
+    fprintf(stderr, "Length:  %10ld to %10ld\n",
+	    t.lusize, t.lcsize);
     fprintf(stderr, "Seq:     %10ld to %10ld in %ld usec\n", 
-	    susize, scsize, stime);
+	    t.susize, t.scsize, t.stime);
     fprintf(stderr, "Qual:    %10ld to %10ld in %ld usec\n", 
-	    qusize, qcsize, qtime);
-    fprintf(stderr, "Other:   %10ld\n", osize);
+	    t.qusize, t.qcsize, t.qtime);
+    fprintf(stderr, "Other:   %10ld\n",
+	    t.osize);
 
     fclose(in_fp);
     fclose(out_fp);
