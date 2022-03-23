@@ -76,6 +76,7 @@
 #include "htscodecs/tokenise_name3.h"
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/varint.h"
+#include "lzp16e.h"
 
 #define BLK_SIZE 512*1000000
 
@@ -847,16 +848,25 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	gettimeofday(&tv1, NULL);
 	int clen;
 
-	out = tok3_encode_names(fq->name_buf, fq->name_len, 7, 0,
-				&clen, NULL);
-	putc(0, out_fp); // name method
+	if (arg->nstrat == 0) {
+	    // TODO: work out a better maximum bound
+	    char *lzp_out = malloc(fq->name_len*2);
+	    clen = lzp(fq->name_buf, fq->name_len, lzp_out);
+	    out = rans_compress_4x16(lzp_out, clen, &clen, 5);
+	    free(lzp_out);
+	    putc(0, out_fp); // name method
+	} else {
+	    out = tok3_encode_names(fq->name_buf, fq->name_len, arg->nlevel,
+		                    0, &clen, NULL);
+	    putc(1, out_fp); // name method
+	}
 	fwrite(&fq->name_len, 1, 4, out_fp);
 	fwrite(&clen, 1, 4, out_fp);
 	fwrite(out, 1, clen, out_fp);
 	t->osize += 9;
 	free(out);
 	if (arg->verbose)
-	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+		fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
 	t->nusize += fq->name_len;
 	t->ncsize += clen;
 	gettimeofday(&tv2, NULL);
@@ -999,7 +1009,6 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	// ----------
 	// Name
 	if ((c = getc(in_fp)) == EOF) break;
-	if (c != 0) return -1; // method
 	if (fread(&u_len, 1, 4, in_fp) != 4)
 	    break;
 	if (fread(&c_len, 1, 4, in_fp) != 4)
@@ -1009,7 +1018,15 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	    break;
 
 	gettimeofday(&tv1, NULL);
-	out = tok3_decode_names(comp, c_len, &u_len);
+	if (c == 0) {
+	    int ru_len;
+	    char *rout = rans_uncompress_4x16(comp, c_len, &ru_len);
+	    out = malloc(u_len);
+	    u_len = unlzp(rout, ru_len, out);
+	    free(rout);
+	} else {
+	    out = tok3_decode_names(comp, c_len, &u_len);
+	}
 	fq->name_buf = out;
 	fq->name_len = u_len;
 	free(comp);
@@ -1101,7 +1118,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	    // Rans
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
 	    fq->qual_buf = out;
-	    fq->qual_len = u_len;
+	    fq->qual_len = out_len = u_len;
 	} else {
 	    // FQZComp qual
 	    fqz_slice s;
@@ -1179,10 +1196,14 @@ int main(int argc, char **argv) {
     extern int optind;
     int opt;
 
-    while ((opt = getopt(argc, argv, "dQ:b:x:BS:vn:s:q:")) != -1) {
+    while ((opt = getopt(argc, argv, "dq:Q:b:x:Bs:S:vn:N:V")) != -1) {
 	switch (opt) {
 	case 'v':
 	    arg.verbose++;
+	    break;
+
+	case 'V':
+	    arg.verbose = -1;
 	    break;
 
 	case 'd':
@@ -1196,7 +1217,6 @@ int main(int argc, char **argv) {
 	case 's':
 	    arg.sstrat = atoi(optarg);
 	    break;
-
 	case 'S':
 	    arg.slevel = atoi(optarg);
 	    if (arg.slevel < 0)
@@ -1208,11 +1228,17 @@ int main(int argc, char **argv) {
 	case 'n':
 	    arg.nstrat = atoi(optarg);
 	    break;
+	case 'N':
+	    arg.nlevel = atoi(optarg);
+	    if (arg.nlevel < 0)
+		arg.nlevel = 0;
+	    if (arg.nlevel > 19)
+		arg.nlevel = 19;
+	    break;
 
 	case 'q':
 	    arg.qstrat = atoi(optarg);
 	    break;
-
 	case 'Q':
 	    arg.qlevel = atoi(optarg);
 	    break;
@@ -1264,16 +1290,18 @@ int main(int argc, char **argv) {
 	    exit(1);
     }
 
-    fprintf(stderr, "Name:    %10ld to %10ld in %ld usec\n",
-	    t.nusize, t.ncsize, t.ntime);
-    fprintf(stderr, "Length:  %10ld to %10ld\n",
-	    t.lusize, t.lcsize);
-    fprintf(stderr, "Seq:     %10ld to %10ld in %ld usec\n", 
-	    t.susize, t.scsize, t.stime);
-    fprintf(stderr, "Qual:    %10ld to %10ld in %ld usec\n", 
-	    t.qusize, t.qcsize, t.qtime);
-    fprintf(stderr, "Other:   %10ld\n",
-	    t.osize);
+    if (arg.verbose >= 0) {
+	fprintf(stderr, "Name:    %10ld to %10ld in %ld usec\n",
+		t.nusize, t.ncsize, t.ntime);
+	fprintf(stderr, "Length:  %10ld to %10ld\n",
+		t.lusize, t.lcsize);
+	fprintf(stderr, "Seq:     %10ld to %10ld in %ld usec\n", 
+		t.susize, t.scsize, t.stime);
+	fprintf(stderr, "Qual:    %10ld to %10ld in %ld usec\n", 
+		t.qusize, t.qcsize, t.qtime);
+	fprintf(stderr, "Other:   %10ld\n",
+		t.osize);
+    }
 
     fclose(in_fp);
     fclose(out_fp);

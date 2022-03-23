@@ -9,8 +9,9 @@ CFLAGS=-g -O3
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $<
 
-fqzcomp5: htscodecs fqzcomp5.o
-	$(CC) $(LDFLAGS) fqzcomp5.o -o $@ $(LIBS) -pthread -lm -lbz2
+OBJ=fqzcomp5.o lzp16e.o
+fqzcomp5: htscodecs $(OBJ)
+	$(CC) $(LDFLAGS) $(OBJ) -o $@ $(LIBS) -pthread -lm -lbz2
 
 htscodecs:
 	cd htscodecs; $(MAKE)
