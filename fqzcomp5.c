@@ -961,7 +961,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	    t->osize += 12; // should add to clen instead?
 	}
 	if (arg->verbose)
-		fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
+	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
 	t->nusize += fq->name_len;
 	t->ncsize += clen;
 	gettimeofday(&tv2, NULL);
@@ -1442,14 +1442,14 @@ int main(int argc, char **argv) {
     }
 
     if (arg.verbose >= 0) {
-	fprintf(stderr, "Name:    %10ld to %10ld in %ld usec\n",
-		t.nusize, t.ncsize, t.ntime);
+	fprintf(stderr, "Name:    %10ld to %10ld in %.2f sec\n",
+		t.nusize, t.ncsize, t.ntime/1e6);
 	fprintf(stderr, "Length:  %10ld to %10ld\n",
 		t.lusize, t.lcsize);
-	fprintf(stderr, "Seq:     %10ld to %10ld in %ld usec\n", 
-		t.susize, t.scsize, t.stime);
-	fprintf(stderr, "Qual:    %10ld to %10ld in %ld usec\n", 
-		t.qusize, t.qcsize, t.qtime);
+	fprintf(stderr, "Seq:     %10ld to %10ld in %.2f sec\n", 
+		t.susize, t.scsize, t.stime/1e6);
+	fprintf(stderr, "Qual:    %10ld to %10ld in %.2f sec\n", 
+		t.qusize, t.qcsize, t.qtime/1e6);
 	fprintf(stderr, "Other:   %10ld\n",
 		t.osize);
     }
