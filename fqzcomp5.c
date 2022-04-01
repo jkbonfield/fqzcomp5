@@ -845,9 +845,13 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 
 	//----------
 	// Names: tok3
+	// Strat 0 = LZP + rANS
+	// Strat 1 = Tok3
+	// Strat 2 = Name(tok3)+Flag(RC)+Comment(LZP+rANS)
 	gettimeofday(&tv1, NULL);
 	int clen;
 
+	fwrite(&fq->name_len, 1, 4, out_fp);
 	if (arg->nstrat == 0) {
 	    // TODO: work out a better maximum bound
 	    char *lzp_out = malloc(fq->name_len*2);
@@ -855,16 +859,107 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	    out = rans_compress_4x16(lzp_out, clen, &clen, 5);
 	    free(lzp_out);
 	    putc(0, out_fp); // name method
-	} else {
+	    fwrite(&clen, 1, 4, out_fp);
+	    fwrite(out, 1, clen, out_fp);
+	    t->osize += 9;
+	    free(out);
+
+	} else if (arg->nstrat == 1) {
 	    out = tok3_encode_names(fq->name_buf, fq->name_len, arg->nlevel,
 		                    0, &clen, NULL);
 	    putc(1, out_fp); // name method
+	    fwrite(&clen, 1, 4, out_fp);
+	    fwrite(out, 1, clen, out_fp);
+	    t->osize += 9;
+	    free(out);
+
+	} else {
+	    char *n1 = malloc(fq->name_len);
+	    char *n2 = malloc(fq->name_len);
+	    char *flag = malloc(fq->name_len/4);  //xx Worst case ?/[01]\n 
+	    char *cp1 = n1, *cp2 = n2;
+	    int i = 0, nr = 0;
+	    // Flag bit 0: has "/NUM"
+	    // Flag bit 1: /1 vs /2
+	    // Flag bit 2: has a comment
+	    // Flag bit 3: space vs tab before comment
+	    while (i < fq->name_len) {
+		int j, k, f = 0;
+		int w1end = 0;
+		int w2start = 0;
+		int w2end = 0;
+		for (j = i; j < fq->name_len; j++) {
+                   if (fq->name_buf[j] == '\0') {
+		       w2end = j;
+		       break;
+	           }
+		   if (!w2start && (fq->name_buf[j] == ' ' ||
+                                    fq->name_buf[j] == '\t')) {
+		       w2end = j;
+		       w2start = j+1;
+		       f |= 4; // FLAG: has comment
+	           }
+	        }
+
+		if (!w2end)
+		    w2end = fq->name_len;
+
+		if (w2start)
+		    // FLAG: space vs tab
+		    f |= fq->name_buf[w2start-1] == ' ' ? 0 : 8;
+
+		if (w2end>1 && fq->name_buf[w2end-2] == '/') {
+		    // FLAG /1 or /2
+		    if (fq->name_buf[w2end-1] == '1')
+			f |= 1, w2end -= 2;
+		    else if (fq->name_buf[w2end-1] == '2')
+			f |= 3, w2end -= 2;
+	        }
+
+		flag[nr++] = f;
+		memcpy(cp1, &fq->name_buf[i], w2end-i);
+		cp1[w2end-i]=0;
+		cp1 += w2end-i+1;
+
+		if (w2start) {
+		    memcpy(cp2, &fq->name_buf[w2start], w2end-w2start);
+		    cp2[w2end-w2start] = 0;
+		    cp2 += w2end-w2start+1;
+		}
+
+		i = j+1;
+	    }
+
+	    int clen1, clen2 = 0, clenf;
+	    out = tok3_encode_names(n1, cp1-n1, arg->nlevel, 0, &clen1, NULL);
+	    char *outf = rans_compress_4x16(flag, nr, &clenf, 129);
+	    char *out2 = NULL;
+	    if (cp2 != n2) {
+		char *lzp_out = malloc((cp2-n2)*2);
+		clen2 = lzp(n2, cp2-n2, lzp_out);
+		out2 = rans_compress_4x16(lzp_out, clen2, &clen2, 5);
+		free(lzp_out);
+	    }
+
+	    clen = clen1 + clenf + clen2 + 8;
+
+	    putc(2, out_fp); // name method
+	    fwrite(&clen,  1, 4, out_fp);
+	    fwrite(&clen1, 1, 4, out_fp);
+	    fwrite(&clenf, 1, 4, out_fp);
+
+	    fwrite(out, 1, clen1, out_fp);
+	    free(out);
+
+	    fwrite(outf, 1, clenf, out_fp);
+	    free(outf);
+
+	    if (out2) {
+		fwrite(out2, 1, clen2, out_fp);
+		free(out2);
+	    }
+	    t->osize += 12; // should add to clen instead?
 	}
-	fwrite(&fq->name_len, 1, 4, out_fp);
-	fwrite(&clen, 1, 4, out_fp);
-	fwrite(out, 1, clen, out_fp);
-	t->osize += 9;
-	free(out);
 	if (arg->verbose)
 		fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
 	t->nusize += fq->name_len;
@@ -1024,8 +1119,64 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	    out = malloc(u_len);
 	    u_len = unlzp(rout, ru_len, out);
 	    free(rout);
-	} else {
+	} else if (c == 1) {
 	    out = tok3_decode_names(comp, c_len, &u_len);
+	} else {
+	    uint32_t clen1 = *(uint32_t *)comp;
+	    uint32_t clenf = *(uint32_t *)(comp+4);
+	    uint32_t clen2 = c_len - clen1 - clenf - 8;
+
+	    // Uncompress 3 separate components
+	    int u_len1, u_lenf, u_len2, ru_len;
+	    char *out1 = tok3_decode_names(comp+8, clen1, &u_len1);
+	    char *outf = rans_uncompress_4x16(comp+8+clen1, clen1, &u_lenf);
+	    char *out2 = NULL;
+	    if (clen2) {
+		int rulen;
+		char *rout = rans_uncompress_4x16(comp+8+clen1+clenf, clen2,
+		                                  &rulen);
+		out2 = malloc(u_len);
+		u_len2 = unlzp(rout, rulen, out2);
+		free(rout);
+	    }
+
+	    // Stitch together ID + flag + comment
+	    char *cp1 = out1, *cp1_end = out1+u_len1;
+	    char *cpf = outf, *cpf_end = outf+u_lenf;
+	    char *cp2 = out2, *cp2_end = out2 + u_len2;
+	    out = malloc(u_len);
+	    char *cp  = out,  *cp_end = out + u_len;
+	    char *last_cp = NULL;
+	    while (cp < cp_end) {
+		while (cp1 < cp1_end && cp < cp_end && *cp1)
+		    *cp++ = *cp1++;
+		cp1++;
+
+		int flag = 0;
+		if (cpf < cpf_end)
+		    flag = *cpf++;
+		if ((flag & 1) && cp+1 < cp_end) {
+		    *cp++ = '/';
+		    *cp++ = (flag & 2) ? '2' : '1';
+	        }
+		
+		if (cp2) {
+		    while (cp2 < cp2_end && cp < cp_end && *cp2)
+			*cp++ = *cp2++;
+		    cp2++;
+	        }
+
+		if (cp == last_cp)
+		    // ran out of data early; avoids looping forever
+		    break;
+
+		*cp++ = 0;
+		last_cp = cp;
+	    }
+
+	    free(out1);
+	    free(outf);
+	    free(out2);
 	}
 	fq->name_buf = out;
 	fq->name_len = u_len;
