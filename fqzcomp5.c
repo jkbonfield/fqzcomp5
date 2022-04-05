@@ -829,7 +829,7 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 static char *encode_names(unsigned char *name_buf,  unsigned int name_len,
 			  int strat, int level, unsigned int *out_size) {
     // TODO: work out a better maximum bound
-    char *nout = malloc(name_len*2), *cp = nout;
+    char *nout = malloc(name_len*2+1000), *cp = nout;
     
     *(uint32_t *)cp = name_len; cp += 4;
     *cp++ = strat; // name method;
@@ -873,31 +873,33 @@ static char *encode_names(unsigned char *name_buf,  unsigned int name_len,
 		}
 		if (!w2start && (name_buf[j] == ' ' ||
 				 name_buf[j] == '\t')) {
-		    w2end = j;
+		    w1end = j;
 		    w2start = j+1;
 		    f |= 4; // FLAG: has comment
 		}
 	    }
 
+	    if (!w1end)
+		w1end = j;
 	    if (!w2end)
-		w2end = name_len;
+		w2end = j;
 
 	    if (w2start)
 		// FLAG: space vs tab
 		f |= name_buf[w2start-1] == ' ' ? 0 : 8;
 
-	    if (w2end>1 && name_buf[w2end-2] == '/') {
+	    if (w1end>1 && name_buf[w1end-2] == '/') {
 		// FLAG /1 or /2
-		if (name_buf[w2end-1] == '1')
-		    f |= 1, w2end -= 2;
-		else if (name_buf[w2end-1] == '2')
-		    f |= 3, w2end -= 2;
+		if (name_buf[w1end-1] == '1')
+		    f |= 1, w1end -= 2;
+		else if (name_buf[w1end-1] == '2')
+		    f |= 3, w1end -= 2;
 	    }
 
 	    flag[nr++] = f;
-	    memcpy(cp1, &name_buf[i], w2end-i);
-	    cp1[w2end-i]=0;
-	    cp1 += w2end-i+1;
+	    memcpy(cp1, &name_buf[i], w1end-i);
+	    cp1[w1end-i]=0;
+	    cp1 += w1end-i+1;
 
 	    if (w2start) {
 		memcpy(cp2, &name_buf[w2start], w2end-w2start);
@@ -964,7 +966,7 @@ static char *decode_names(unsigned char *comp,  unsigned int c_len,
 	// Uncompress 3 separate components
 	int u_len1, u_lenf, u_len2, ru_len;
 	char *out1 = tok3_decode_names(comp+8, clen1, &u_len1);
-	char *outf = rans_uncompress_4x16(comp+8+clen1, clen1, &u_lenf);
+	char *outf = rans_uncompress_4x16(comp+8+clen1, clenf, &u_lenf);
 	char *out2 = NULL;
 	if (clen2) {
 	    int rulen;
@@ -995,6 +997,9 @@ static char *decode_names(unsigned char *comp,  unsigned int c_len,
 		*cp++ = (flag & 2) ? '2' : '1';
 	    }
 		
+	    if (flag & 4)
+		*cp++ = (flag & 8) ? '\t' : ' ';
+
 	    if (cp2) {
 		while (cp2 < cp2_end && cp < cp_end && *cp2)
 		    *cp++ = *cp2++;
@@ -1005,7 +1010,14 @@ static char *decode_names(unsigned char *comp,  unsigned int c_len,
 		// ran out of data early; avoids looping forever
 		break;
 
-	    *cp++ = 0;
+	    if (cp < cp_end) {
+		*cp++ = 0;
+	    } else {
+		free(out1);
+		free(outf);
+		free(out2);
+		goto err;
+	    }
 	    last_cp = cp;
 	}
 
@@ -1015,6 +1027,10 @@ static char *decode_names(unsigned char *comp,  unsigned int c_len,
     }
 
     return out;
+
+ err:
+    free(out);
+    return NULL;
 }
 
 typedef struct {
