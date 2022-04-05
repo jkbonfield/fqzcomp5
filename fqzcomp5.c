@@ -468,7 +468,7 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
 // An order-N arithmetic encoder, dedicated to sequence contexts.
 char *encode_seq(unsigned char *in,  unsigned int in_size,
-		 int *len, int both_strands, int ctx_size,
+		 int *len, int nrecords, int both_strands, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int *out_size) {
     char *out = malloc(in_size + 100);
     if (!out)
@@ -630,7 +630,12 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		// Without: 76655812              60731188
 		// With:    75789505 -1.1%        59638082 -1.8%
 		// Slowdown 0.2%                  1.9%
-		if (--seq_len == 0) {
+		if (--seq_len == 0 && i+j+1 < in_size) {
+		    if (nseq >= nrecords) {
+			free(out);
+			free(seq_model);
+			return NULL;
+		    }
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
@@ -641,7 +646,12 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 	case other:
 	    for (j = 0; j < run; j++) {
 		SIMPLE_MODEL(256, _encodeSymbol)(&literal, &rc, in[i+j]);
-		if (--seq_len == 0) {
+		if (--seq_len == 0 && i+j+1 < in_size) {
+		    if (nseq >= nrecords) {
+			free(out);
+			free(seq_model);
+			return NULL;
+		    }
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
@@ -683,7 +693,7 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 }
 
 char *decode_seq(unsigned char *in,  unsigned int in_size,
-		 int *len, int both_strands, int ctx_size,
+		 int *len, int nrecords, int both_strands, int ctx_size,
 		 /*unsigned char *out,*/ unsigned int out_size) {
     char *out = malloc(out_size);
     if (!out)
@@ -759,7 +769,12 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 		    SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
 	        }
 
-		if (--seq_len == 0) {
+		if (--seq_len == 0 && i+j+1 < out_size) {
+		    if (nseq >=  nrecords) {
+			free(out);
+			free(seq_model);
+			return NULL;
+		    }
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
@@ -771,7 +786,12 @@ char *decode_seq(unsigned char *in,  unsigned int in_size,
 	case other: // ambiguity codes
 	    for (j = 0; j < run; j++) {
 		out[i+j] = SIMPLE_MODEL(256, _decodeSymbol)(&literal, &rc);
-		if (--seq_len == 0) {
+		if (--seq_len == 0 && i+j+1 < out_size) {
+		    if (nseq >=  nrecords) {
+			free(out);
+			free(seq_model);
+			return NULL;
+		    }
 		    seq_len = len[nseq++];
 		    last = 0x007616c7 & mask;
 		    last2 = (0x2c6b62ff >> (32 - 2*ctx_size)) & mask;
@@ -876,7 +896,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	} else {
 	    char *n1 = malloc(fq->name_len);
 	    char *n2 = malloc(fq->name_len);
-	    char *flag = malloc(fq->name_len/4);  //xx Worst case ?/[01]\n 
+	    char *flag = malloc(fq->name_len/2);  //Worst case\n 
 	    char *cp1 = n1, *cp2 = n2;
 	    int i = 0, nr = 0;
 	    // Flag bit 0: has "/NUM"
@@ -959,6 +979,9 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 		free(out2);
 	    }
 	    t->osize += 12; // should add to clen instead?
+	    free(n1);
+	    free(n2);
+	    free(flag);
 	}
 	if (arg->verbose)
 	    fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
@@ -1005,8 +1028,13 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	// Seq: rans or statistical modelling
 	gettimeofday(&tv1, NULL);
 	if (arg->sstrat == 1) {
-	    out = encode_seq(fq->seq_buf, fq->seq_len, fq->len,
+	    out = encode_seq(fq->seq_buf, fq->seq_len,
+			     fq->len, fq->num_records,
 			     arg->both_strands, arg->slevel, &clen);
+	    if (!out) {
+		fprintf(stderr, "ERR: failed to encode sequence\n");
+		return -1;
+	    }
 	    putc((arg->slevel<<4) | (arg->both_strands<<3) | 1, out_fp);
 	    fwrite(&fq->seq_len, 1, 4, out_fp);
 	    fwrite(&clen, 1, 4, out_fp);
@@ -1103,9 +1131,9 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 
 	// ----------
 	// Name
-	if ((c = getc(in_fp)) == EOF) break;
 	if (fread(&u_len, 1, 4, in_fp) != 4)
 	    break;
+	if ((c = getc(in_fp)) == EOF) break;
 	if (fread(&c_len, 1, 4, in_fp) != 4)
 	    break;
 	comp = malloc(c_len);
@@ -1237,7 +1265,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	    break;
 	gettimeofday(&tv1, NULL);
 	if ((c & 7) == 1) {
-	    out = decode_seq(comp, c_len, fq->len,
+	    out = decode_seq(comp, c_len, fq->len, fq->num_records,
 			     arg->both_strands, arg->slevel, u_len);
 	} else {
 	    out = rans_uncompress_4x16(comp, c_len, &u_len);
