@@ -1422,11 +1422,19 @@ int main(int argc, char **argv) {
 	    arg.qlevel = atoi(optarg);
 	    break;
 
-	case 'b':
-	    arg.blk_size = atoi(optarg);
-	    if (arg.blk_size > BLK_SIZE)
-		arg.blk_size = BLK_SIZE;
+	case 'b': {
+	    char *endp;
+	    arg.blk_size = strtol(optarg, &endp, 0);
+	    if (*endp == 'k' || *endp == 'K')
+		arg.blk_size *= 1000;
+	    else if (*endp == 'm' || *endp == 'M')
+		arg.blk_size *= 1000000;
+	    else if (*endp == 'g' || *endp == 'G')
+		arg.blk_size *= 1000000000;
+	    if (arg.blk_size < 100000)
+		arg.blk_size = 100000;
 	    break;
+	}
 
 	case 'x': {
 	    // Hex digits are:
