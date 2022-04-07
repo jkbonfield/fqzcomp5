@@ -36,6 +36,9 @@ QC   Compressed quality data
 // - Tokenise name with different alphabets.
 //   See ~/scratch/data/enano_vir/ERR2708432.fastq
 
+// - Split fqzcomp_qual by read/1 and read/2 flags.
+//   See /local/scratch01/jkb/_9827_1m.fq for example.
+
 // - Split aux tags into own data series using CRAM's TL + per tag.
 
 // - Seq encoding using STR + copy-number?
@@ -110,6 +113,7 @@ QC   Compressed quality data
 #include "htscodecs/tokenise_name3.h"
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/varint.h"
+#include "thread_pool.h"
 #include "lzp16e.h"
 
 #define BLK_SIZE 512*1000000
@@ -173,7 +177,7 @@ void fastq_dump(fastq *fq) {
 }
 
 #define goto if (fprintf(stderr, "ERR %s:%d\n", __FILE__, __LINE__)) goto
-fastq *load_seqs(FILE *in, int blk_size) {
+fastq *load_seqs(char *in, int blk_size, int *last_offset) {
     fastq *fq = calloc(1, sizeof(*fq));
     if (!fq)
 	goto err;
@@ -190,7 +194,9 @@ fastq *load_seqs(FILE *in, int blk_size) {
     fq->fixed_len = -1;
 
     int name_i = 0, seq_i = 0, qual_i = 0;
+    int last_start = 0;
     while (i < blk_size) {
+	last_start = i;
 	if (nr >= ar) {
 	    ar = ar*1.5 + 10000;
 	    fq->name = realloc(fq->name, ar*sizeof(char *));
@@ -202,28 +208,27 @@ fastq *load_seqs(FILE *in, int blk_size) {
 
 	// @name
 	fq->name[nr] = name_i;
-	if ((c = getc(in)) != '@') {
-	    if (c == EOF)
-		break;
-	    else
-		goto err;
-	}
-	while ((c = getc(in)) != EOF && c != '\n') {
-	    if (name_i >= name_sz) {
+	c = in[i++];
+	if (c != '@')
+	    goto err;
+
+	int name_i_ = name_i; // tmp copy so we can unwind a partial decode
+	while (i < blk_size && (c = in[i++]) && c != '\n') {
+	    if (name_i_ >= name_sz) {
 		name_sz = name_sz * 1.5 + 1000;
 		name_buf = fq->name_buf = realloc(fq->name_buf, name_sz);
 	    }
-	    name_buf[name_i++] = c;
+	    name_buf[name_i_++] = c;
 	}
-	if (c == EOF)
-	    goto err;
-	name_buf[name_i++] = 0;
-	i += name_i - fq->name[nr];
+	if (i == blk_size)
+	    break;
+
+	name_buf[name_i_++] = 0;
 
 	int flag = 0;
-	if (name_i > 2 &&
-	    name_buf[name_i-1] == '2' &&
-	    name_buf[name_i-2] == '/')
+	if (name_i_ > 2 &&
+	    name_buf[name_i_-1] == '2' &&
+	    name_buf[name_i_-2] == '/')
 	    flag = FQZ_FREAD2;
 	if (last_name >= 0 &&
 	    strcmp(fq->name_buf + fq->name[nr], fq->name_buf + last_name))
@@ -234,20 +239,20 @@ fastq *load_seqs(FILE *in, int blk_size) {
 	// seq
 	fq->seq[nr] = seq_i;
 	int len = seq_i;
-	while ((c = getc(in)) != EOF && c != '\n') {
-	    if (seq_i >= seq_sz) {
+	int seq_i_ = seq_i;
+	while (i < blk_size && (c = in[i++]) && c != '\n') {
+	    if (seq_i_ >= seq_sz) {
 		// very unlikely given blk_size/2 starting point,
 		// but not impossible.
 		seq_sz = seq_sz * 1.5 + 1000;
 		seq_buf = fq->seq_buf = realloc(fq->seq_buf, seq_sz);
 	    }
-	    seq_buf[seq_i++] = c;
+	    seq_buf[seq_i_++] = c;
 	}
-	if (c == EOF)
-	    goto err;
-	fq->len[nr] = seq_i - len;
-	//seq_buf[seq_i++] = '\n'; // use instead of length terminator?
-	i += seq_i - fq->seq[nr];
+	if (i == blk_size)
+	    break;
+	fq->len[nr] = seq_i_ - len;
+	//seq_buf[seq_i_++] = '\n'; // use instead of length terminator?
 
 	if (fq->fixed_len == -1)
 	    fq->fixed_len = fq->len[nr];
@@ -256,33 +261,43 @@ fastq *load_seqs(FILE *in, int blk_size) {
 		fq->fixed_len = 0;
 
 	// +(name)
-	if ((c = getc(in)) != '+')
+	if (i < blk_size && (c = in[i++]) != '+')
 	    goto err;
-	while ((c = getc(in)) != EOF && c != '\n')
-	    i++;
-	if (c == EOF)
-	    goto err;
-	i++;
+	while (i < blk_size && (c = in[i++]) && c != '\n')
+	    ;
+	if (i == blk_size)
+	    break;
 
 	// qual
 	fq->qual[nr] = qual_i;
 	len = qual_i;
-	while ((c = getc(in)) != EOF && c != '\n') {
-	    if (qual_i >= qual_sz) {
+	int qual_i_ = qual_i;
+	while (i < blk_size && (c = in[i++]) && c != '\n') {
+	    if (qual_i_ >= qual_sz) {
 		// very unlikely given blk_size/2 starting point
 		qual_sz = qual_sz * 1.5 + 1000;
 		qual_buf = fq->qual_buf = realloc(fq->qual_buf, qual_sz);
 	    }
-	    qual_buf[qual_i++] = c-33;
+	    qual_buf[qual_i_++] = c-33;
 	}
-	if (c == EOF)
-	    goto err;
-	if (fq->len[nr] != qual_i - len)
-	    goto err;
-	i += qual_i - fq->qual[nr];
 
+	if (fq->len[nr] != qual_i_ - len) {
+	    if (i == blk_size)
+		break;
+
+	    goto err;
+	}
+
+	name_i = name_i_;
+	seq_i  = seq_i_;
+	qual_i = qual_i_;
 	nr++;
     }
+
+    // FIXME: need to deal with case where block size is smaller than
+    // a single record!  For now that puts a limit on smallest block size.
+    *last_offset = last_start; // so we can continue for next block
+    
     fq->name_len = name_i;
     fq->seq_len  = seq_i;
     fq->qual_len = qual_i;
@@ -297,6 +312,7 @@ fastq *load_seqs(FILE *in, int blk_size) {
     return NULL;
 }
 
+#if 0
 static uint64_t manual_strats[10] = {0};
 static int manual_nstrat = 0;
 
@@ -486,6 +502,7 @@ int fqz_manual_parameters(fqz_gparams *gp,
 
     return 0;
 }
+#endif
 
 #define NSYM 256
 #define STEP 8
@@ -1075,15 +1092,79 @@ typedef struct {
     int verbose;
     int both_strands;
     int blk_size;
+    int nthread;
 } opts;
 
 typedef struct {
+    int64_t nblock;
     int64_t nusize, ncsize, ntime;
     int64_t susize, scsize, stime;
     int64_t qusize, qcsize, qtime;
     int64_t lusize, lcsize, ltime;
-    int64_t osize;
 } timings;
+
+static inline uint64_t tvdiff(struct timeval *tv1, struct timeval *tv2) {
+    return (tv2->tv_sec - tv1->tv_sec) * 1000000
+	+ tv2->tv_usec - tv1->tv_usec;
+}
+
+void update_stats(timings *t,
+		  int column, // 0=name 1=seq 2=qual 3=length
+		  int64_t usize, int csize, int time) {
+    switch (column) {
+    case 0:
+	t->nusize += usize;
+	t->ncsize += csize;
+	t->ntime  += time;
+	break;
+    case 1:
+	t->susize += usize;
+	t->scsize += csize;
+	t->stime  += time;
+	break;
+    case 2:
+	t->qusize += usize;
+	t->qcsize += csize;
+	t->qtime  += time;
+	break;
+    case 3:
+	t->lusize += usize;
+	t->lcsize += csize;
+	t->ltime  += time;
+	break;
+    }
+}
+
+void append_timings(timings *t1, timings *t2, int verbose) {
+    t1->nblock++;
+
+    t1->nusize += t2->nusize;
+    t1->ncsize += t2->ncsize;
+    t1->ntime  += t2->ntime;
+
+    t1->susize += t2->susize;
+    t1->scsize += t2->scsize;
+    t1->stime  += t2->stime;
+
+    t1->qusize += t2->qusize;
+    t1->qcsize += t2->qcsize;
+    t1->qtime  += t2->qtime;
+
+    t1->lusize += t2->lusize;
+    t1->lcsize += t2->lcsize;
+    t1->ltime  += t2->ltime;
+
+    if (verbose) {
+	fprintf(stderr, "Names   %10ld to %10ld in %.2f sec\n",
+		t2->nusize, t2->ncsize, t2->ntime/1e6);
+	fprintf(stderr, "Lengths %10ld to %10ld in %.2f sec\n",
+		t2->lusize, t2->lcsize, t2->ltime/1e6);
+	fprintf(stderr, "Seqs    %10ld to %10ld in %.2f sec\n",
+		t2->susize, t2->scsize, t2->stime/1e6);
+	fprintf(stderr, "Quals   %10ld to %10ld in %.2f sec\n\n",
+		t2->qusize, t2->qcsize, t2->qtime/1e6);
+    }
+}
 
 #define APPEND_OUT(dat, len) do {			\
     if (*out_size < comp_sz + (len)) {			\
@@ -1118,13 +1199,8 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     APPEND_OUT(out, clen);
     free(out);
 
-    if (arg->verbose)
-	fprintf(stderr, "Names: %10d to %10d\n", fq->name_len, clen);
-    t->nusize += fq->name_len;
-    t->ncsize += clen;
     gettimeofday(&tv2, NULL);
-    t->ntime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-    t->ntime += tv2.tv_usec - tv1.tv_usec;
+    update_stats(t, 0, fq->name_len, clen, tvdiff(&tv1, &tv2));
 
     //----------
     // Read lengths
@@ -1133,12 +1209,8 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
 	unsigned char buf[5], nb = 1;
 	nb += var_put_u32(buf+1, NULL, fq->fixed_len);
 	buf[0] = nb-1;
-	t->osize += 0;
-	t->lusize += 4*fq->num_records;
-	t->lcsize += nb;
+	update_stats(t, 3, 4*fq->num_records, nb, 0);
 	APPEND_OUT(buf, nb);
-	if (arg->verbose)
-	    fprintf(stderr, "Len:   %10d to %10d\n", 4*fq->num_records, nb);
     } else {
 	// Variable length (next byte 0), with 4 byte len followed
 	// by var-int lengths.
@@ -1153,11 +1225,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
 	APPEND_OUT(buf, nb);
 	free(buf);
 
-	t->lusize += fq->num_records*4;
-	t->lcsize += nb;
-	if (arg->verbose)
-	    fprintf(stderr, "Len:   %10d to %10d\n",
-		    4*fq->num_records, nb);
+	update_stats(t, 3, 4*fq->num_records, nb, 0);
     }
 
     //----------
@@ -1188,13 +1256,8 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     APPEND_OUT(out, clen);
     free(out);
 
-    if (arg->verbose)
-	fprintf(stderr, "Seq:   %10d to %10d\n", fq->seq_len, clen);
-    t->susize += fq->seq_len;
-    t->scsize += clen+9;
     gettimeofday(&tv2, NULL);
-    t->stime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-    t->stime += tv2.tv_usec - tv1.tv_usec;
+    update_stats(t, 1, fq->seq_len, clen+9, tvdiff(&tv1, &tv2));
 
     //----------
     // Qual: rans or fqz
@@ -1236,13 +1299,8 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     APPEND_OUT(out, out_len);
     free(out);
 
-    if (arg->verbose)
-	fprintf(stderr, "Qual:  %10d to %10d\n", fq->qual_len, (int)out_len);
-    t->qusize += fq->qual_len;
-    t->qcsize += out_len+9;
     gettimeofday(&tv2, NULL);
-    t->qtime += (tv2.tv_sec - tv1.tv_sec) * 1000000;
-    t->qtime += tv2.tv_usec - tv1.tv_usec;
+    update_stats(t, 2, fq->qual_len, out_len+9, tvdiff(&tv1, &tv2));
 
     *out_size = comp_sz;
 
@@ -1399,20 +1457,89 @@ fastq *decode_block(unsigned char *in, unsigned int in_size, timings *t) {
     return NULL;
 }
 
-int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
+typedef struct {
+    fqz_gparams *gp;
+    opts *arg;
+    timings t;
+    fastq *fq;
+    char *comp;
+    uint32_t clen;
+    int eof;
+} enc_dec_job;
+
+static void *encode_thread(void *arg) {
+    enc_dec_job *j = (enc_dec_job *)arg;
+    if (j->eof)
+	return j;
+
+    j->comp = encode_block(j->gp, j->arg, j->fq, &j->t, &j->clen);
+    fastq_free(j->fq);
+    return j;
+}
+
+#define THREADED
+
+// TODO: use async read and write threads too so main doesn't block on I/O
+int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
+	   timings *t) {
+#ifdef THREADED
+    int n = arg->nthread, end = 0;
+    hts_tpool *p = hts_tpool_init(n);
+    hts_tpool_process *q = hts_tpool_process_init(p, n*2, 0);
+    hts_tpool_result *r;
+    enc_dec_job *j;
+#endif
+
+    char *in = malloc(arg->blk_size);
+    int in_rem = 0;
+
     for(;;) {
-	fastq *fq = load_seqs(in_fp, arg->blk_size);
+	int nbytes = fread(in+in_rem, 1, arg->blk_size - in_rem, in_fp);
+	if (nbytes < 0)
+	    return -1;
+	if (nbytes == 0)
+	    break;
+	nbytes += in_rem;
+
+	fastq *fq = load_seqs(in, nbytes, &in_rem);
+	memmove(in, in+in_rem, nbytes - in_rem);
+	in_rem = nbytes - in_rem;
+
 	if (!fq)
 	    return -1;
 
-	if (arg->verbose)
-	    fprintf(stderr, "Loaded nrec = %d\n", fq->num_records);
 	if (!fq->num_records) {
 	    fastq_free(fq);
 	    break;
 	}
 	//fastq_dump(fq);
 
+#ifdef THREADED
+	// Dispatch a job
+	j = calloc(1, sizeof(*j));
+	j->gp = gp;
+	j->arg = arg;
+	memset(&j->t, 0, sizeof(j->t));
+	j->fq = fq;
+	j->eof = 0;
+
+	if (hts_tpool_dispatch(p, q, encode_thread, j) != 0)
+	    goto err;
+
+	// Check for a result
+	if ((r = hts_tpool_next_result(q))) {
+	    j = hts_tpool_result_data(r);
+	    if (j->eof) {
+		end = 1;
+	    } else {
+		append_timings(t, &j->t, arg->verbose);
+		fwrite(&j->clen, 1, 4, out_fp);
+		fwrite(j->comp, 1, j->clen, out_fp);
+		free(j->comp);
+	    }
+	    hts_tpool_delete_result(r, 1);
+	}
+#else
 	uint32_t clen;
 	char *out = encode_block(gp, arg, fq, t, &clen);
 	fwrite(&clen, 1, 4, out_fp);
@@ -1420,12 +1547,98 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg, timings *t) {
 	free(out);
 
 	fastq_free(fq);
+#endif
     }
+
+#ifdef THREADED
+    j = malloc(sizeof(*j));
+    j->eof = 1;
+    if (hts_tpool_dispatch(p, q, encode_thread, j) != 0)
+	goto err;
+
+    // End of input, so work through remaining results
+    while (!end && (r = hts_tpool_next_result_wait(q))) {
+	enc_dec_job *j = hts_tpool_result_data(r);
+	if (j->eof) {
+	    end = 1;
+	} else {
+	    append_timings(t, &j->t, arg->verbose);
+	    fwrite(&j->clen, 1, 4, out_fp);
+	    fwrite(j->comp, 1, j->clen, out_fp);
+	    free(j->comp);
+	}
+	hts_tpool_delete_result(r, 1);
+    }
+    hts_tpool_process_destroy(q);
+    hts_tpool_destroy(p);
+#endif
+
+    return 0;
+
+ err:
+    return -1;
+}
+
+int output_fastq(FILE *out_fp, fastq *fq) {
+    char *np = fq->name_buf;
+    char *sp = fq->seq_buf;
+    char *qp = fq->qual_buf;
+
+#if 1
+    // A bit faster sometimes.
+    int len = fq->name_len + fq->seq_len + fq->qual_len + fq->num_records*5;
+    char *buf = malloc(len), *cp = buf;
+
+    for (int i = 0; i < fq->num_records; i++) {
+	*cp++ = '@';
+	while ((*cp++ = *np++))
+	    ;
+	*--cp = '\n'; cp++;
+	memcpy(cp, sp, fq->len[i]);
+	cp += fq->len[i];
+	sp += fq->len[i];
+	*cp++ = '\n';
+	*cp++ = '+';
+	*cp++ = '\n';
+	memcpy(cp, qp, fq->len[i]);
+	cp += fq->len[i];
+	qp += fq->len[i];
+	*cp++ = '\n';
+    }
+    fwrite(buf, 1, cp-buf, out_fp);
+    free(buf);
+#else
+    for (int i = 0; i < fq->num_records; i++) {
+	fprintf(out_fp, "@%s\n%.*s\n+\n%.*s\n",
+		np, fq->len[i], sp, fq->len[i], qp);
+	np += strlen(np)+1;
+	sp += fq->len[i];
+	qp += fq->len[i];
+    }
+#endif
 
     return 0;
 }
 
+static void *decode_thread(void *arg) {
+    enc_dec_job *j = (enc_dec_job *)arg;
+    if (j->eof)
+	return j;
+
+    j->fq = decode_block(j->comp, j->clen, &j->t);
+    free(j->comp);
+    return j;
+}
+
 int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
+#ifdef THREADED
+    int n = arg->nthread, end = 0;
+    hts_tpool *p = hts_tpool_init(n);
+    hts_tpool_process *q = hts_tpool_process_init(p, n*2, 0);
+    hts_tpool_result *r;
+    enc_dec_job *j;
+#endif
+
     for (;;) {
 	// Load next compressed block
 	int i, c_len;
@@ -1438,6 +1651,32 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	comp = malloc(c_len);
 	if (fread(comp, 1, c_len, in_fp) != c_len)
 	    return -1;
+
+#ifdef THREADED
+	// Dispatch a job
+	j = calloc(1, sizeof(*j));
+	memset(&j->t, 0, sizeof(j->t));
+	j->comp = comp;
+	j->clen = c_len;
+	j->fq = NULL;
+	j->eof = 0;
+
+	if (hts_tpool_dispatch(p, q, decode_thread, j) != 0)
+	    goto err;
+
+	// Check for a result
+	if ((r = hts_tpool_next_result(q))) {
+	    j = hts_tpool_result_data(r);
+	    if (j->eof) {
+		end = 1;
+	    } else {
+		append_timings(t, &j->t, arg->verbose);
+		output_fastq(out_fp, j->fq);
+		free(j->fq);
+	    }
+	    hts_tpool_delete_result(r, 1);
+	}
+#else
 	fastq *fq = decode_block(comp, c_len, t);
 
 	// ----------
@@ -1456,9 +1695,36 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 
 	fastq_free(fq);
 	free(comp);
+#endif
     }
 
+#ifdef THREADED
+    j = malloc(sizeof(*j));
+    j->eof = 1;
+    if (hts_tpool_dispatch(p, q, decode_thread, j) != 0)
+	goto err;
+
+    // End of input, so work through remaining results
+    while (!end && (r = hts_tpool_next_result_wait(q))) {
+	enc_dec_job *j = hts_tpool_result_data(r);
+	if (j->eof) {
+	    end = 1;
+	} else {
+	    append_timings(t, &j->t, arg->verbose);
+	    output_fastq(out_fp, j->fq);
+	    free(j->fq);
+	}
+	hts_tpool_delete_result(r, 1);
+    }
+    hts_tpool_process_destroy(q);
+    hts_tpool_destroy(p);
+#endif
+
     return 0;
+
+ err:
+    // FIXME: tidy up
+    return -1;
 }
 
 int main(int argc, char **argv) {
@@ -1477,6 +1743,7 @@ int main(int argc, char **argv) {
 	.both_strands =0,
 	.verbose = 0,
 	.blk_size = BLK_SIZE,
+	.nthread = 4,
     };
 
 #ifdef _WIN32
@@ -1488,8 +1755,14 @@ int main(int argc, char **argv) {
     extern int optind;
     int opt;
 
-    while ((opt = getopt(argc, argv, "dq:Q:b:x:Bs:S:vn:N:V")) != -1) {
+    while ((opt = getopt(argc, argv, "dq:Q:b:x:Bs:S:vn:N:Vt:")) != -1) {
 	switch (opt) {
+	case 't':
+	    arg.nthread = atoi(optarg);
+	    if (arg.nthread < 1)
+		arg.nthread = 1;
+	    break;
+
 	case 'v':
 	    arg.verbose++;
 	    break;
@@ -1544,11 +1817,12 @@ int main(int argc, char **argv) {
 		arg.blk_size *= 1000000;
 	    else if (*endp == 'g' || *endp == 'G')
 		arg.blk_size *= 1000000000;
-	    if (arg.blk_size < 100000)
-		arg.blk_size = 100000;
+//	    if (arg.blk_size < 100000)
+//		arg.blk_size = 100000;
 	    break;
 	}
 
+#if 0
 	case 'x': {
 	    // Hex digits are:
 	    // qbits  qshift
@@ -1566,6 +1840,7 @@ int main(int argc, char **argv) {
 	    gp = &gp_local;
 	    break;
 	}
+#endif
 	}
     }
 
@@ -1584,13 +1859,14 @@ int main(int argc, char **argv) {
     }
 
     if (arg.verbose >= 0) {
-	fprintf(stderr, "Name:    %10ld to %10ld in %.2f sec\n",
+	fprintf(stderr, "All %ld blocks combined:\n", t.nblock);
+	fprintf(stderr, "Names    %10ld to %10ld in %.2f sec\n",
 		t.nusize, t.ncsize, t.ntime/1e6);
-	fprintf(stderr, "Length:  %10ld to %10ld\n",
+	fprintf(stderr, "Lengths  %10ld to %10ld\n",
 		t.lusize, t.lcsize);
-	fprintf(stderr, "Seq:     %10ld to %10ld in %.2f sec\n", 
+	fprintf(stderr, "Seqs     %10ld to %10ld in %.2f sec\n", 
 		t.susize, t.scsize, t.stime/1e6);
-	fprintf(stderr, "Qual:    %10ld to %10ld in %.2f sec\n", 
+	fprintf(stderr, "Qual     %10ld to %10ld in %.2f sec\n", 
 		t.qusize, t.qcsize, t.qtime/1e6);
     }
 
