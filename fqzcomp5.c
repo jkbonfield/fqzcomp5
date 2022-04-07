@@ -165,17 +165,6 @@ void fastq_free(fastq *fq) {
     free(fq);
 }
 
-// Debug function
-void fastq_dump(fastq *fq) {
-    int i;
-    for (i = 0; i < fq->num_records; i++) {
-	printf("@%s\n%.*s\n+\n%.*s\n",
-	       fq->name_buf + fq->name[i],
-	       fq->len[i], fq->seq_buf + fq->seq[i],
-	       fq->len[i], fq->qual_buf + fq->qual[i]);
-    }
-}
-
 #define goto if (fprintf(stderr, "ERR %s:%d\n", __FILE__, __LINE__)) goto
 fastq *load_seqs(char *in, int blk_size, int *last_offset) {
     fastq *fq = calloc(1, sizeof(*fq));
@@ -196,7 +185,6 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
     int name_i = 0, seq_i = 0, qual_i = 0;
     int last_start = 0;
     while (i < blk_size) {
-	last_start = i;
 	if (nr >= ar) {
 	    ar = ar*1.5 + 10000;
 	    fq->name = realloc(fq->name, ar*sizeof(char *));
@@ -226,12 +214,12 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
 	name_buf[name_i_++] = 0;
 
 	int flag = 0;
-	if (name_i_ > 2 &&
-	    name_buf[name_i_-1] == '2' &&
-	    name_buf[name_i_-2] == '/')
+	if (name_i_ > 3 &&
+	    name_buf[name_i_-2] == '2' &&
+	    name_buf[name_i_-3] == '/')
 	    flag = FQZ_FREAD2;
 	if (last_name >= 0 &&
-	    strcmp(fq->name_buf + fq->name[nr], fq->name_buf + last_name))
+	    strcmp(fq->name_buf + fq->name[nr], fq->name_buf + last_name) == 0)
 	    flag = FQZ_FREAD2;
 	fq->flag[nr] = flag;
 	last_name = fq->name[nr];
@@ -291,6 +279,8 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
 	name_i = name_i_;
 	seq_i  = seq_i_;
 	qual_i = qual_i_;
+
+	last_start = i;
 	nr++;
     }
 
@@ -1267,9 +1257,12 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     if (arg->qstrat == 0) {
 	// Fast mode
 	meta[0] = 0;
+	// orientation can affect ratio.
+	// Also can stripe.  Striping to qual length may be worth it in
+	// some extreme cases!  Eg (193 + 8 + (100<<8)) on 9827.fq
+	// May also want to segregate by R1 and R2?
 	out = (char *)rans_compress_4x16((uint8_t *)fq->qual_buf, fq->seq_len,
 					 &clen, 193);
-	// crash on /tmp/_1m4.fq with mode 197.  Why?
 	out_len = clen;
     } else {
 	meta[0] = 1;
@@ -1512,7 +1505,6 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	    fastq_free(fq);
 	    break;
 	}
-	//fastq_dump(fq);
 
 #ifdef THREADED
 	// Dispatch a job
@@ -1541,6 +1533,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	}
 #else
 	uint32_t clen;
+	t->nblock++;
 	char *out = encode_block(gp, arg, fq, t, &clen);
 	fwrite(&clen, 1, 4, out_fp);
 	fwrite(out, 1, clen, out_fp);
@@ -1677,6 +1670,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	    hts_tpool_delete_result(r, 1);
 	}
 #else
+	t->nblock++;
 	fastq *fq = decode_block(comp, c_len, t);
 
 	// ----------
@@ -1737,10 +1731,10 @@ int main(int argc, char **argv) {
 	.qstrat = 1, // 0=rans, 1=fqz
 	.qlevel = 0,
 	.sstrat = 1, // 0=rans, 1=fqz
-	.slevel = 12,
-	.nstrat = 1, // (0=rans), 1=tok3
+	.slevel = 12,// seq context = 4^12 
+	.nstrat = 2, // (0=rans), 1=tok3, 2=tok3 + comments
 	.nlevel = 7,
-	.both_strands =0,
+	.both_strands =0, // adjusts seq strat 1.
 	.verbose = 0,
 	.blk_size = BLK_SIZE,
 	.nthread = 4,
