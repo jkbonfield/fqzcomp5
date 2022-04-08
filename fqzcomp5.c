@@ -1,3 +1,37 @@
+/* Tests for fqz codec */
+/*
+ * Copyright (c) 2019,2020,2022 Genome Research Ltd.
+ * Author(s): James Bonfield
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *    1. Redistributions of source code must retain the above copyright notice,
+ *       this list of conditions and the following disclaimer.
+ *
+ *    2. Redistributions in binary form must reproduce the above
+ *       copyright notice, this list of conditions and the following
+ *       disclaimer in the documentation and/or other materials provided
+ *       with the distribution.
+ *
+ *    3. Neither the names Genome Research Ltd and Wellcome Trust Sanger
+ *       Institute nor the names of its contributors may be used to endorse
+ *       or promote products derived from this software without specific
+ *       prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY GENOME RESEARCH LTD AND CONTRIBUTORS "AS
+ * IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL GENOME RESEARCH
+ * LTD OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 /*
 File format:
 
@@ -33,20 +67,12 @@ QC   Compressed quality data
  */
 
 // TODO
-// - Tokenise name with different alphabets.
-//   See ~/scratch/data/enano_vir/ERR2708432.fastq
-
-// - Split fqzcomp_qual by read/1 and read/2 flags.
-//   See /local/scratch01/jkb/_9827_1m.fq for example.
-
 // - Split aux tags into own data series using CRAM's TL + per tag.
 
 // - Seq encoding using STR + copy-number?
-//   May work well for ONT/PacBio where run len varies.
-
-// - Also permit old name encoding (fqzcomp -n1).
-//   Better on above data. Why?
-//   (fqz -n1: 912989, -n2: 1340223, paq8: 891928
+//   Couldn't get this to work well though, even though it sounds like an
+//   ideal thing for ONT/PB-CLR.  Maybe let it kick in after so many bases
+//   in a homopolymer?
 
 // - Removal of lengths from fqzqual stream
 
@@ -54,48 +80,13 @@ QC   Compressed quality data
 
 // - Exploration of multiple rans options (o4, o5, o133, o197?)
 
-// - Reuse of memory buffers for sped
-
-// - Threading!
+// - Reuse of memory buffers for speed
 
 // - Increase sizes of fqzcomp contexts?  Not so useful for CRAM, but maybe
 //   it's still beneficial to go beyond 16-bit.
 
 // - Improve fqzcomp tables to permit any mapping rather than monotonic.
 
-/* Tests for fqz codec */
-/*
- * Copyright (c) 2019,2020,2022 Genome Research Ltd.
- * Author(s): James Bonfield
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *    1. Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and the following disclaimer.
- *
- *    2. Redistributions in binary form must reproduce the above
- *       copyright notice, this list of conditions and the following
- *       disclaimer in the documentation and/or other materials provided
- *       with the distribution.
- *
- *    3. Neither the names Genome Research Ltd and Wellcome Trust Sanger
- *       Institute nor the names of its contributors may be used to endorse
- *       or promote products derived from this software without specific
- *       prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY GENOME RESEARCH LTD AND CONTRIBUTORS "AS
- * IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL GENOME RESEARCH
- * LTD OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -1694,6 +1685,32 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
     return -1;
 }
 
+void usage(FILE *fp) {
+    fprintf(fp, "Usage: fqzcomp5 [options]    [input.fastq [output.fqz5]]\n");
+    fprintf(fp, "Usage: fqzcomp5 [options] -d [input.fqz5  [output.fastq]]\n");
+    fprintf(fp, "\nOptions:\n");
+    fprintf(fp, "    -d            Decompress\n");
+    fprintf(fp, "    -t INT        Number of threads.  Defaults to 4\n");
+    fprintf(fp, "    -b SIZE       Specify block size. May use K, M and G sufixes\n");
+    fprintf(fp, "    -v            Increase verbostity\n");
+    fprintf(fp, "    -V            Silent mode\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "    -n INT        Name encoding method (0=rANS, 1=tok3, 2=tok3+LZP)\n");
+    fprintf(fp, "    -N INT        Name encoding strategy.\n");
+    fprintf(fp, "    -s INT        Sequence encoding method (0=rANS, 1=fqz)\n");
+    fprintf(fp, "    -S INT        Sequence encoding strategy (context size)\n");
+    fprintf(fp, "    -B            Update sequence context on both strands\n");
+    fprintf(fp, "    -q INT        Quality encoding method (0=rANS, 1=fqz)\n");
+    fprintf(fp, "    -Q INT        Quality encoding strategy (0 to 3)\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "Compression levels:\n");
+    fprintf(fp, "    -1            Equivalent to -n0 -s0 -q0 -b10M\n");
+    fprintf(fp, "    -3            Equivalent to -n1 -s0 -q0 -b100M\n");
+    fprintf(fp, "    -5            Equivalent to -n2 -s1 -q1 -b100M\n");
+    fprintf(fp, "    -7            Equivalent to -n2 -s1 -q1 -b500M -B -S14\n");
+    fprintf(fp, "    -9            Equivalent to -n2 -s1 -q1 -b1GM  -B -S15\n");
+}
+
 int main(int argc, char **argv) {
     int decomp = 0;
     fqz_gparams *gp = NULL, gp_local;
@@ -1722,7 +1739,7 @@ int main(int argc, char **argv) {
     extern int optind;
     int opt;
 
-    while ((opt = getopt(argc, argv, "dq:Q:b:x:Bs:S:vn:N:Vt:")) != -1) {
+    while ((opt = getopt(argc, argv, "dq:Q:b:x:Bs:S:vn:N:Vt:h13579")) != -1) {
 	switch (opt) {
 	case 't':
 	    arg.nthread = atoi(optarg);
@@ -1791,6 +1808,46 @@ int main(int argc, char **argv) {
 	    break;
 	}
 
+	case '1':
+	    arg.nstrat = 0;
+	    arg.sstrat = 0;
+	    arg.qstrat = 0;
+	    arg.blk_size = 10e6;
+	    break;
+
+	case '3':
+	    arg.nstrat = 1;
+	    arg.sstrat = 0;
+	    arg.qstrat = 0;
+	    arg.blk_size = 100e6;
+	    break;
+
+	case '5':
+	    arg.nstrat = 2;
+	    arg.sstrat = 1;
+	    arg.qstrat = 1;
+	    arg.blk_size = 100e6;
+	    break;
+
+	case '7':
+	    // TODO: also add format detection, so qlevel is adjusted
+	    // per file.  Or auto-sensing and learning strategy (ala CRAM)
+	    arg.nstrat = 2;
+	    arg.sstrat = 1;
+	    arg.both_strands = 1;
+	    arg.slevel = 14;
+	    arg.qstrat = 1;
+	    break;
+
+	case '9':
+	    arg.nstrat = 2;
+	    arg.sstrat = 1;
+	    arg.both_strands = 1;
+	    arg.slevel = 15;
+	    arg.qstrat = 1;
+	    arg.blk_size = 1e9;
+	    break;
+
 #if 0
 	case 'x': {
 	    // Hex digits are:
@@ -1810,7 +1867,20 @@ int main(int argc, char **argv) {
 	    break;
 	}
 #endif
+
+	case 'h':
+	    usage(stdout);
+	    return 0;
+
+	default:
+	    usage(stderr);
+	    return 1;
 	}
+    }
+
+    if (optind == argc && isatty(0)) {
+	usage(stdout);
+	return 0;
     }
 
     in_fp = optind < argc ? fopen(argv[optind], "r") : stdin;
