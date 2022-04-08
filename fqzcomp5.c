@@ -621,8 +621,6 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		if (both_strands) {
 		    int b2 = last2 & 3;
 		    last2 = last2/4 + ((3-b) << (2*ctx_size-2));
-		    // Can't predict prefetch for other end.
-		    //_mm_prefetch((const char *)&seq_model[last2], _MM_HINT_T0);
 		    SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
 		}
 
@@ -1045,7 +1043,7 @@ typedef struct {
     int nlevel, slevel, qlevel;
     int verbose;
     int both_strands;
-    int blk_size;
+    uint32_t blk_size;
     int nthread;
 } opts;
 
@@ -1775,8 +1773,10 @@ int main(int argc, char **argv) {
 		arg.blk_size *= 1000000;
 	    else if (*endp == 'g' || *endp == 'G')
 		arg.blk_size *= 1000000000;
-//	    if (arg.blk_size < 100000)
-//		arg.blk_size = 100000;
+	    if (arg.blk_size < 1000000)
+		arg.blk_size = 1000000;
+	    if (arg.blk_size > 2000000000)
+		arg.blk_size = 2000000000;
 	    break;
 	}
 
