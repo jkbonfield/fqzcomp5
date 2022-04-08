@@ -18,3 +18,5 @@ htscodecs:
 
 clean:
 	-rm fqzcomp5 *.o
+
+.PHONY: htscodecs

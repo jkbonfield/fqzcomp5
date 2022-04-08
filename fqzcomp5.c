@@ -274,7 +274,8 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
 		break;
 
 	    goto err;
-	}
+	} else if (i == blk_size && c != '\n')
+	    break;
 
 	name_i = name_i_;
 	seq_i  = seq_i_;
@@ -520,11 +521,9 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
     int i;
 
     SMALL_MODEL(4,_) *seq_model = malloc(msize * sizeof(*seq_model));
-//    SMALL_MODEL(4,_) *hom_len = malloc(msize * sizeof(*hom_len));
-    for (i = 0; i < msize; i++) {
+
+    for (i = 0; i < msize; i++)
 	SMALL_MODEL(4,_init)(&seq_model[i]);
-//	SMALL_MODEL(4,_init)(&hom_len[i]);
-    }
 
     SMALL_MODEL(2,_) state_model[3];
     SIMPLE_MODEL(256,_) run_len[3];
@@ -606,45 +605,10 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 	}
 
 	// Encode the symbols
-//	int rep_len = 0;
-//	int last_base = 99;
-//	int last_base2 = 98;
 	switch (state) {
 	case uc_ACGT:
 	case lc_ACGT:
 	    for (j = 0; j < run; j++) {
-#if 0
-		// Encode GAAAT as G0 A3 T0
-		int k;
-		for (k = j+1; k < run; k++) {
-		    if (in[i+k] != in[i+j])
-			break;
-		}
-		int r2 = k-j-1;
-		//int rctx = ((last & 0x3ff)<<4);
-		int rctx = last & (mask>>2);
-		int n = 0;
-		do {
-		    SMALL_MODEL(4,_encodeSymbol)(&hom_len[rctx & 0xfff], &rc,
-						 MIN(3,r2));
-		    rctx = (rctx & (mask>>2)) | (n<<(2*ctx_size-2));
-		    r2 -= 3;
-		    n+=(n<3);
-		} while(r2 >= 0);
- 		j = k-1;
-#endif
-
-// Use previous repeat length as part of seq context.
-// Also poor (but not as bad as above)
-//		rep_len = (last_base == last_base2)
-//		    ? rep_len+(rep_len<3)
-//		    : 0;
-//		last_base2 = last_base;
-//		last_base = in[i+j];
-//		unsigned char b = L[in[i+j]] & 3;
-//		int ctx = (last&(mask>>2)) | (rep_len<<(2*ctx_size-2));
-//		SMALL_MODEL(4, _encodeSymbol)(&seq_model[ctx], &rc, b);
-
 		unsigned char b = L[in[i+j]] & 3;
 		SMALL_MODEL(4, _encodeSymbol)(&seq_model[last], &rc, b);
 
@@ -652,8 +616,8 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		_mm_prefetch((const char *)&seq_model[(last<<4)&mask],
 			     _MM_HINT_T0);
 
-		// 0.7% and 3.2% smaller for _.FQ and _.fq respectively (at ctx_size 12),
-		// but 45% more CPU for seq encoding.
+		// 0.7% and 3.2% smaller for _.FQ and _.fq respectively
+		// (at ctx_size 12), but 45% more CPU for seq encoding.
 		if (both_strands) {
 		    int b2 = last2 & 3;
 		    last2 = last2/4 + ((3-b) << (2*ctx_size-2));
