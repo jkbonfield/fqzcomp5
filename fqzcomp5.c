@@ -613,8 +613,11 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		SMALL_MODEL(4, _encodeSymbol)(&seq_model[last], &rc, b);
 
 		last = ((last<<2) + b) & mask;
-		_mm_prefetch((const char *)&seq_model[(last<<4)&mask],
-			     _MM_HINT_T0);
+		int pf = ((last<<6)&mask)
+			 +(i+j+3<in_size
+			   ?L[in[i+j+1]]*16+L[in[i+j+2]]*4+L[in[i+j+3]]
+			   :0);
+		_mm_prefetch((const char *)&seq_model[pf], _MM_HINT_T0);
 
 		// 0.7% and 3.2% smaller for _.FQ and _.fq respectively
 		// (at ctx_size 12), but 45% more CPU for seq encoding.
@@ -622,6 +625,14 @@ char *encode_seq(unsigned char *in,  unsigned int in_size,
 		    int b2 = last2 & 3;
 		    last2 = last2/4 + ((3-b) << (2*ctx_size-2));
 		    SMALL_MODEL(4, _updateSymbol)(&seq_model[last2], b2);
+
+		    // ~25% speed gain by prefetching bottom strand too
+		    uint32_t i3 = i+j+3 < in_size
+			? L[in[i+j+1]] + L[in[i+j+2]]*4 + L[in[i+j+3]]*16
+			: 0;
+		    i3 = (0x3f - i3) << (2*ctx_size-6);
+		    pf = i+j+3 < in_size ? (last2>>6) +i3 : 0;
+		    _mm_prefetch((const char *)&seq_model[pf], _MM_HINT_T0);
 		}
 
 		// In theory we should reset context for each new sequence
