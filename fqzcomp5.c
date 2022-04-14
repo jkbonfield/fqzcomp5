@@ -90,6 +90,10 @@ QC   Compressed quality data
 // - Distinguish explicit method opts (-s1 -S13B -q1 -Q2 etc) from auto
 //   picked options (-3, -5) which use auto-selected metrics
 
+// - We don't need large input fastq blocks to do large block compression.
+//   We could separate model reset from block boundaries, so blocks are small
+//   but reset boundaries less common.
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -99,6 +103,8 @@ QC   Compressed quality data
 #include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
+#include <errno.h>
+#include <pthread.h>
 #include <sys/time.h>
 
 #include "htscodecs/varint.h"
@@ -155,6 +161,7 @@ typedef struct {
     int review, trial;
 } metrics;
 
+pthread_mutex_t metric_m = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t method_avail[SEC_LAST];
 static methods method_used[SEC_LAST];
 static metrics stats[SEC_LAST];
@@ -1178,7 +1185,8 @@ void append_timings(timings *t1, timings *t2, int verbose) {
 // Updates the metrics counters and returns the methods to use.
 // Method returned is a bitfield of (1<<method_num).
 int metrics_method(int sec) {
-    // FIXME: add locking
+    pthread_mutex_lock(&metric_m);
+
     if (stats[sec].review == 0) {
 	stats[sec].review = METRICS_REVIEW;
 	stats[sec].trial  = METRICS_TRIAL;
@@ -1201,7 +1209,7 @@ int metrics_method(int sec) {
 		best_m = m;
 	    }
 	}
-	fprintf(stderr, "Choose best method %d for sec %d\n", best_m, sec);
+	//fprintf(stderr, "Choose best method %d for sec %d\n", best_m, sec);
 	method_used[sec] = best_m;
 	method = 1<<method_used[sec];
 
@@ -1213,14 +1221,18 @@ int metrics_method(int sec) {
     }
     stats[sec].review--;
 
+    pthread_mutex_unlock(&metric_m);
+
     return method;
 }
 
 // Update the metrics for a given section and method.
 // Method parameter isn't a bitfield, but the method number itself.
 void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
+    pthread_mutex_lock(&metric_m);
     stats[sec].usize[method] += usize;
     stats[sec].csize[method] += csize;
+    pthread_mutex_unlock(&metric_m);
     //fprintf(stderr, "Section %d  method %d  size %ld\n", sec, method, csize);
 }
 
@@ -1663,7 +1675,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
     hts_tpool *p = hts_tpool_init(n);
     hts_tpool_process *q = hts_tpool_process_init(p, n*2, 0);
     hts_tpool_result *r;
-    enc_dec_job *j;
+    enc_dec_job *j, *jr;
 #endif
 
     char *in = malloc(arg->blk_size);
@@ -1698,21 +1710,41 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	j->fq = fq;
 	j->eof = 0;
 
-	if (hts_tpool_dispatch(p, q, encode_thread, j) != 0)
-	    goto err;
-
-	// Check for a result
-	if ((r = hts_tpool_next_result(q))) {
-	    j = hts_tpool_result_data(r);
-	    if (j->eof) {
-		end = 1;
-	    } else {
-		append_timings(t, &j->t, arg->verbose);
-		fwrite(&j->clen, 1, 4, out_fp);
-		fwrite(j->comp, 1, j->clen, out_fp);
-		free(j->comp);
+	int ret = -1;
+	while (ret == -1) {
+	    // Always dispatch, going over-size on queue
+	    if ((ret=hts_tpool_dispatch2(p, q, encode_thread, j, -1)) != 0) {
+		if (errno != EAGAIN)
+		    goto err;
+		//fprintf(stderr, "Couldn't dispatch\n");
 	    }
-	    hts_tpool_delete_result(r, 1);
+	    //fprintf(stderr, "r=%d\n", ret);
+
+	    // Check for a result.
+	    // If input queue is oversize then do this blocking so we
+	    // don't grow input queue indefinitely.
+	    // TODO: same issue exists on decoder side.
+	    do {
+		if (hts_tpool_dispatch_would_block(p, q)) {
+		    //fprintf(stderr, "would block: in=%d\n", q->n_input);
+		    r = hts_tpool_next_result_wait(q);
+		} else {
+		    //fprintf(stderr, "would pass : in=%d\n", q->n_input);
+		    r = hts_tpool_next_result(q);
+		}
+		if (r) {
+		    jr = hts_tpool_result_data(r);
+		    if (jr->eof) {
+			end = 1;
+		    } else {
+			append_timings(t, &jr->t, arg->verbose);
+			fwrite(&jr->clen, 1, 4, out_fp);
+			fwrite(jr->comp, 1, jr->clen, out_fp);
+			free(jr->comp);
+		    }
+		    hts_tpool_delete_result(r, 1);
+		}
+	    } while (r && hts_tpool_dispatch_would_block(p, q)); // necessary?
 	}
 #else
 	uint32_t clen;
@@ -1729,7 +1761,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 #ifdef THREADED
     j = malloc(sizeof(*j));
     j->eof = 1;
-    if (hts_tpool_dispatch(p, q, encode_thread, j) != 0)
+    if (hts_tpool_dispatch2(p, q, encode_thread, j, -1) != 0)
 	goto err;
 
     // End of input, so work through remaining results
@@ -1837,21 +1869,31 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	j->fq = NULL;
 	j->eof = 0;
 
-	if (hts_tpool_dispatch(p, q, decode_thread, j) != 0)
+	// Always put on queue, even if over queue size
+	if (hts_tpool_dispatch2(p, q, decode_thread, j, -1) != 0)
 	    goto err;
 
-	// Check for a result
-	if ((r = hts_tpool_next_result(q))) {
-	    j = hts_tpool_result_data(r);
-	    if (j->eof) {
-		end = 1;
+	// Check for a result.
+	do {
+	    if (hts_tpool_dispatch_would_block(p, q)) {
+		//fprintf(stderr, "would block: in=%d\n", q->n_input);
+		r = hts_tpool_next_result_wait(q);
 	    } else {
-		append_timings(t, &j->t, arg->verbose);
-		output_fastq(out_fp, j->fq);
-		free(j->fq);
+		//fprintf(stderr, "would pass : in=%d\n", q->n_input);
+		r = hts_tpool_next_result(q);
 	    }
-	    hts_tpool_delete_result(r, 1);
-	}
+	    if (r) {
+		j = hts_tpool_result_data(r);
+		if (j->eof) {
+		    end = 1;
+		} else {
+		    append_timings(t, &j->t, arg->verbose);
+		    output_fastq(out_fp, j->fq);
+		    free(j->fq);
+		}
+		hts_tpool_delete_result(r, 1);
+	    }
+	} while (r && hts_tpool_dispatch_would_block(p, q));
 #else
 	t->nblock++;
 	fastq *fq = decode_block(comp, c_len, t);
