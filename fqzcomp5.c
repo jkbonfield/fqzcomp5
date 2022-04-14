@@ -87,6 +87,8 @@ QC   Compressed quality data
 
 // - Improve fqzcomp tables to permit any mapping rather than monotonic.
 
+// - Distinguish explicit method opts (-s1 -S13B -q1 -Q2 etc) from auto
+//   picked options (-3, -5) which use auto-selected metrics
 
 #include <stdio.h>
 #include <stdint.h>
@@ -113,6 +115,49 @@ QC   Compressed quality data
 #  define MIN(a,b) ((a)<(b)?(a):(b))
 #  define MAX(a,b) ((a)>(b)?(a):(b))
 #endif
+
+// Review metrics stats every X blocks for Y trials
+#define METRICS_REVIEW 50
+#define METRICS_TRIAL 3
+
+typedef enum {
+    SEC_NAME,
+    SEC_LEN,
+    SEC_SEQ,
+    SEC_QUAL,
+    SEC_LAST
+} sections;
+
+typedef enum {
+    // general purpose
+    RANS0=1, RANS1, RANS64, RANS65, RANS128, RANS129, RANS192, RANS193,
+    //RANSXN1  TODO: stripe N-way where N is fixed read len?
+
+    // LZP; differing min lengths?  Make len part of format?
+    LZP3, /* TODO: could use on seq too maybe */
+    // TODO LZP2, LZP4, LZP16? Needs storing in byte stream too
+
+    // Name specific
+    TOK3_3, TOK3_5, TOK3_7, TOK3_9,
+    TOK3_3_LZP, TOK3_5_LZP, TOK3_7_LZP, TOK3_9_LZP,
+
+    // Seq
+    SEQ10, SEQ12, SEQ12B, SEQ13B, SEQ14B, SEQ_CUSTOM/*TODO*/,
+
+    // Qual
+    FQZ_AUTO, FQZ0, FQZ1, FQZ2, FQZ3, QUAL_CUSTOM/*TODO*/,
+
+    M_LAST,
+} methods;
+
+typedef struct {
+    uint64_t usize[M_LAST], csize[M_LAST];   // current accumulated sizes
+    int review, trial;
+} metrics;
+
+static uint32_t method_avail[SEC_LAST];
+static methods method_used[SEC_LAST];
+static metrics stats[SEC_LAST];
 
 typedef struct {
     int num_records;                 // number of fastq entries
@@ -1130,6 +1175,172 @@ void append_timings(timings *t1, timings *t2, int verbose) {
 } while(0);
 
 
+// Updates the metrics counters and returns the methods to use.
+// Method returned is a bitfield of (1<<method_num).
+int metrics_method(int sec) {
+    // FIXME: add locking
+    if (stats[sec].review == 0) {
+	stats[sec].review = METRICS_REVIEW;
+	stats[sec].trial  = METRICS_TRIAL;
+	memset(stats[sec].usize, 0, M_LAST * sizeof(*stats[sec].usize));
+	memset(stats[sec].csize, 0, M_LAST * sizeof(*stats[sec].csize));
+    }
+
+    int method;
+    if (stats[sec].trial>0) {
+	method = method_avail[sec];
+	stats[sec].trial--;
+    } else if (stats[sec].trial == 0) {
+	stats[sec].trial--;
+	int m, best_m = 0;
+	uint32_t best_sz = UINT_MAX;
+	for (m = 0; m < M_LAST; m++) {
+	    // TODO: parameterise by speed too, plus small block offset?
+	    if (best_sz > stats[sec].csize[m] && stats[sec].csize[m]) {
+		best_sz = stats[sec].csize[m];
+		best_m = m;
+	    }
+	}
+	fprintf(stderr, "Choose best method %d for sec %d\n", best_m, sec);
+	method_used[sec] = best_m;
+	method = 1<<method_used[sec];
+
+	// TODO: methods that consistently get rejected can be removed from
+	// the method_avail.  This is a second level based on
+	// total accumulated size stats.
+    } else {
+	method = 1<<method_used[sec];
+    }
+    stats[sec].review--;
+
+    return method;
+}
+
+// Update the metrics for a given section and method.
+// Method parameter isn't a bitfield, but the method number itself.
+void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
+    stats[sec].usize[method] += usize;
+    stats[sec].csize[method] += csize;
+    //fprintf(stderr, "Section %d  method %d  size %ld\n", sec, method, csize);
+}
+
+// TODO: return buffer + meta, so we don't need memcpy and memmove calls.
+char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
+			    int sec, char *in, unsigned int in_size,
+			    unsigned int *out_size, int *strat) {
+    uint8_t *best_comp = NULL;
+    uint32_t best_sz = UINT_MAX;
+    int      best_strat = 0;
+    char *out;
+    int m;
+    size_t out_len;
+
+    for (m = 0; m < M_LAST; m++) {
+	if (!(methods & (1<<m)))
+	    continue;
+
+	switch (m) {
+	case RANS0:
+	case RANS1:
+	case RANS64:
+	case RANS65:
+	case RANS128:
+	case RANS129:
+	case RANS192:
+	case RANS193: {
+	    int order[] = {0,1,64,65,128,129,192,193};
+	    *strat = 0;
+	    out = (char *)rans_compress_4x16((uint8_t *)in, in_size,
+					     out_size, order[m-RANS0]);
+	    out_len = *out_size;
+	    break;
+	}
+
+	case LZP3:
+	    out = encode_names(in, in_size, 0 /* LZP + rANS o5 */,
+			       (m-TOK3_3)*2+3, out_size);
+	    out_len = *out_size;
+	    break;
+
+	case TOK3_3:
+	case TOK3_5:
+	case TOK3_7:
+	case TOK3_9:
+	    out = encode_names(in, in_size, 1 /* TOK3 */,
+			       (m-TOK3_3)*2+3, out_size);
+	    out_len = *out_size;
+	    break;
+
+	case TOK3_3_LZP:
+	case TOK3_5_LZP:
+	case TOK3_7_LZP:
+	case TOK3_9_LZP:
+	    out = encode_names(in, in_size, 2 /* TOK3+LZP */,
+			       (m-TOK3_3_LZP)*2+3, out_size);
+	    out_len = *out_size;
+	    break;
+
+	case SEQ10:
+	case SEQ12:
+	case SEQ12B:
+	case SEQ13B:
+	case SEQ14B: {
+	    int slevel[]   = {10,12,12,13,14};
+	    int both_str[] = {0, 0, 1, 1, 1};
+
+	    int s = m-SEQ10;
+
+	    *strat = (slevel[s]<<4) | (both_str[s]<<3) | 1;
+	    out = encode_seq(in, in_size, fq->len, fq->num_records,
+			     both_str[s], slevel[s], out_size);
+	    out_len = *out_size;
+	    break;
+	}
+
+	case FQZ0:
+	case FQZ1:
+	case FQZ2:
+	case FQZ3: {
+	    *strat = 1;
+	    fqz_slice *s = malloc(fq->num_records * sizeof(*s));
+	    s->num_records = fq->num_records;
+	    s->len = fq->len;
+	    s->flags = fq->flag;
+	    s->seq = malloc(fq->num_records * sizeof(char *));
+	    int i, j;
+	    for (i = j = 0; i < fq->num_records; j += fq->len[i++])
+		s->seq[i] = (unsigned char *)fq->seq_buf + j;
+
+	    // FIXME: expose fqz_pick_parameters function so we
+	    // can initialise it here and then also turn off DO_LEN.
+	    out = fqz_compress(4, s, in, in_size, 
+			       &out_len, m-FQZ0, gp);
+	    free(s->seq);
+	    free(s);
+	    break;
+	}
+
+	default:
+	    fprintf(stderr, "Unsupported method %d (set 0x%x)\n", m, methods);
+	    abort();
+	}
+
+	if (best_sz > out_len) {
+	    best_sz = out_len;
+	    best_comp = out;
+	    best_strat = *strat;
+	} else {
+	    free(out);
+	}
+	metrics_update(sec, m, in_size, out_len);
+    }
+    out = best_comp;
+
+    *out_size = best_sz;
+    *strat    = best_strat;
+    return out;
+}
+
 // Encodes a single block of data
 char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
 		   unsigned int *out_size) {
@@ -1139,6 +1350,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     *out_size = 1000;//arg->blk_size/4 + 10000;
     char *comp = malloc(*out_size), *out;
     unsigned int clen, comp_sz = 0;
+    int strat = 0, method;
 
     APPEND_OUT(&fq->num_records, 4);
 
@@ -1148,8 +1360,15 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     // Strat 1 = Tok3
     // Strat 2 = Name(tok3)+Flag(RC)+Comment(LZP+rANS)
     gettimeofday(&tv1, NULL);
+#if 1
+    method = metrics_method(SEC_NAME);
+    out = compress_with_methods(gp, fq, method, SEC_NAME,
+				fq->name_buf, fq->name_len,
+				&clen, &strat);
+#else
     out = encode_names((uint8_t *)fq->name_buf, fq->name_len, arg->nstrat,
 		       arg->nlevel, &clen);
+#endif
     APPEND_OUT(out, clen);
     free(out);
 
@@ -1186,24 +1405,13 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     // Seq: rans or statistical modelling
     gettimeofday(&tv1, NULL);
     uint8_t  meta[9];
-    if (arg->sstrat == 1) {
-	out = encode_seq((uint8_t *)fq->seq_buf, fq->seq_len,
-			 fq->len, fq->num_records,
-			 arg->both_strands, arg->slevel, &clen);
-	if (!out) {
-	    fprintf(stderr, "ERR: failed to encode sequence\n");
-	    return NULL;
-	}
-	meta[0] = (arg->slevel<<4) | (arg->both_strands<<3) | 1;
-    } else {
-	// FIXME: test 197, 65 and 1
-	// FIXME: also try fqz for encoding, qmap and qshift=2.
-	// But need extension to permit reverse complement.
-	// Also not quite the same in terms of model updates?
-	out = (char *)rans_compress_4x16((uint8_t *)fq->seq_buf, fq->seq_len,
-					 &clen, 197);
-	meta[0] = 0; // seq strat
-    }
+
+    method = metrics_method(SEC_SEQ);
+    out = compress_with_methods(gp, fq, method, SEC_SEQ,
+				fq->seq_buf, fq->seq_len,
+				&clen, &strat);
+    meta[0] = strat;
+
     *(uint32_t *)(&meta[1]) = fq->seq_len;
     *(uint32_t *)(&meta[5]) = clen;
     APPEND_OUT(meta, 9);
@@ -1218,46 +1426,22 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     // Convert fastq struct to fqz_slice for context
     gettimeofday(&tv1, NULL);
     size_t out_len = 0;
-    if (arg->qstrat == 0) {
-	// Fast mode
-	meta[0] = 0;
-	// orientation can affect ratio.
-	// Also can stripe.  Striping to qual length may be worth it in
-	// some extreme cases!  Eg (193 + 8 + (100<<8)) on 9827.fq
-	// May also want to segregate by R1 and R2?
-	out = (char *)rans_compress_4x16((uint8_t *)fq->qual_buf, fq->seq_len,
-					 &clen, 193);
-	out_len = clen;
-    } else {
-	meta[0] = 1;
-	fqz_slice *s = malloc(fq->num_records * sizeof(*s));
-	s->num_records = fq->num_records;
-	s->len = fq->len;
-	s->flags = fq->flag;
-	s->seq = malloc(fq->num_records * sizeof(char *));
-	int i, j;
-	for (i = j = 0; i < fq->num_records; j += fq->len[i++])
-	    s->seq[i] = (unsigned char *)fq->seq_buf + j;
 
-	// FIXME: expose fqz_pick_parameters function so we
-	// can initialise it here and then also turn off DO_LEN.
+    method = metrics_method(SEC_QUAL);
+    out = compress_with_methods(gp, fq, method, SEC_QUAL,
+				fq->qual_buf, fq->qual_len,
+				&clen, &strat);
+    meta[0] = strat;
+    //fprintf(stderr, "Qual %d -> %d via %d\n", fq->qual_len, clen, strat);
 
-	// Concatenate qualities together into a single block.
-	// FIXME: move qual down by 33, '!'.
-	out = fqz_compress(4, s, fq->qual_buf, fq->qual_len,
-			   &out_len, arg->qlevel, gp);
-	free(s->seq);
-	free(s);
-    }
-    
     *(uint32_t *)(&meta[1]) = fq->qual_len;
-    *(uint32_t *)(&meta[5]) = out_len;
+    *(uint32_t *)(&meta[5]) = clen;
     APPEND_OUT(meta, 9);
-    APPEND_OUT(out, out_len);
+    APPEND_OUT(out, clen);
     free(out);
 
     gettimeofday(&tv2, NULL);
-    update_stats(t, 2, fq->qual_len, out_len+9, tvdiff(&tv1, &tv2));
+    update_stats(t, 2, fq->qual_len, clen+9, tvdiff(&tv1, &tv2));
 
     *out_size = comp_sz;
 
@@ -1439,6 +1623,41 @@ static void *encode_thread(void *arg) {
 // TODO: use async read and write threads too so main doesn't block on I/O
 int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	   timings *t) {
+    int rans_methods = (1<<RANS0) | (1<<RANS1) | (1<<RANS129) | (1<<RANS193);
+    // Name
+    method_avail[SEC_NAME] = 1<<LZP3;
+    if (arg->nstrat == 1) {
+	method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
+	method_avail[SEC_NAME] |= 1<<(TOK3_3 + arg->nlevel/2-1);
+    }
+    if (arg->nstrat == 2)
+	method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
+    
+    // Seq
+    method_avail[SEC_SEQ] = rans_methods;
+    if (arg->sstrat == 1) {
+	if (arg->slevel >= 10)
+	    method_avail[SEC_SEQ] |= 1<<SEQ10;
+	if (arg->slevel >= 12) {
+	    if (arg->both_strands | arg->slevel > 12)
+		method_avail[SEC_SEQ] |= 1<<SEQ12B;
+	    else
+		method_avail[SEC_SEQ] |= 1<<SEQ12;
+	}
+	if (arg->slevel >= 13)
+	    method_avail[SEC_SEQ] |= 1<<SEQ13B;
+	if (arg->slevel >= 14)
+	    method_avail[SEC_SEQ] |= 1<<SEQ14B;
+    }
+
+    // Qual
+    method_avail[SEC_QUAL] = rans_methods;
+    if (arg->qstrat == 1) {
+	int m;
+	for (m = 0; m <= arg->qlevel && m <= 3; m++)
+	    method_avail[SEC_QUAL] |= 1<<(FQZ0+m);
+    }
+
 #ifdef THREADED
     int n = arg->nthread, end = 0;
     hts_tpool *p = hts_tpool_init(n);
@@ -1723,7 +1942,7 @@ int main(int argc, char **argv) {
 	.sstrat = 1, // 0=rans, 1=fqz
 	.slevel = 12,// seq context = 4^12 
 	.nstrat = 2, // (0=rans), 1=tok3, 2=tok3 + comments
-	.nlevel = 7,
+	.nlevel = 5,
 	.both_strands =0, // adjusts seq strat 1.
 	.verbose = 0,
 	.blk_size = BLK_SIZE,
@@ -1817,6 +2036,7 @@ int main(int argc, char **argv) {
 
 	case '3':
 	    arg.nstrat = 1;
+	    arg.nlevel = 3;
 	    arg.sstrat = 0;
 	    arg.qstrat = 0;
 	    arg.blk_size = 100e6;
@@ -1824,27 +2044,33 @@ int main(int argc, char **argv) {
 
 	case '5':
 	    arg.nstrat = 2;
+	    arg.nlevel = 5;
 	    arg.sstrat = 1;
 	    arg.qstrat = 1;
 	    arg.blk_size = 100e6;
+	    arg.qlevel = 1;
 	    break;
 
 	case '7':
 	    // TODO: also add format detection, so qlevel is adjusted
 	    // per file.  Or auto-sensing and learning strategy (ala CRAM)
 	    arg.nstrat = 2;
+	    arg.nlevel = 7;
 	    arg.sstrat = 1;
 	    arg.both_strands = 1;
 	    arg.slevel = 14;
 	    arg.qstrat = 1;
+	    arg.qlevel = 3;
 	    break;
 
 	case '9':
 	    arg.nstrat = 2;
+	    arg.nlevel = 9;
 	    arg.sstrat = 1;
 	    arg.both_strands = 1;
 	    arg.slevel = 15;
 	    arg.qstrat = 1;
+	    arg.qlevel = 3;
 	    arg.blk_size = 1e9;
 	    break;
 
