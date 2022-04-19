@@ -134,24 +134,27 @@ typedef enum {
     SEC_LAST
 } sections;
 
+// TODO: add method costs too
 typedef enum {
     // general purpose
     RANS0=1, RANS1, RANS64, RANS65, RANS128, RANS129, RANS192, RANS193,
-    //RANSXN1  TODO: stripe N-way where N is fixed read len?
+    RANSXN1,
 
     // LZP; differing min lengths?  Make len part of format?
     LZP3, /* TODO: could use on seq too maybe */
     // TODO LZP2, LZP4, LZP16? Needs storing in byte stream too
 
-    // Name specific
+    // Name specific; may just use arg.slevel and ignore multiplicity here?
+    // Do we ever want to gather starts on multiple compression levels to
+    // judge if worth it?  Maybe, but only for highest probably.
     TOK3_3, TOK3_5, TOK3_7, TOK3_9,
     TOK3_3_LZP, TOK3_5_LZP, TOK3_7_LZP, TOK3_9_LZP,
 
     // Seq
-    SEQ10, SEQ12, SEQ12B, SEQ13B, SEQ14B, SEQ_CUSTOM/*TODO*/,
+    SEQ10, SEQ12, SEQ12B, SEQ13B, SEQ14B, SEQ_CUSTOM,
 
     // Qual
-    FQZ_AUTO, FQZ0, FQZ1, FQZ2, FQZ3, QUAL_CUSTOM/*TODO*/,
+    FQZ0, FQZ1, FQZ2, FQZ3,
 
     M_LAST,
 } methods;
@@ -1092,9 +1095,14 @@ static char *decode_names(unsigned char *comp,  unsigned int c_len,
     return NULL;
 }
 
+// nstrat 0 = LZP+rans
+// nstrat 1 = TOK3
+// nstrat 2 = TOK3 name, LZP+rans comment
 typedef struct {
     int nstrat, sstrat, qstrat;
-    int nlevel, slevel, qlevel;
+    int scustom;                 // explicit -S -B user options
+    int nlevel, slevel, qlevel;  // explicit level specified
+    int nauto,  sauto,  qauto;   // generic -1 to -9 options (bit-wise levels)
     int verbose;
     int both_strands;
     uint32_t blk_size;
@@ -1237,12 +1245,13 @@ void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
 }
 
 // TODO: return buffer + meta, so we don't need memcpy and memmove calls.
-char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
+char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
+			    uint32_t methods,
 			    int sec, char *in, unsigned int in_size,
 			    unsigned int *out_size, int *strat) {
     uint8_t *best_comp = NULL;
     uint32_t best_sz = UINT_MAX;
-    int      best_strat = 0;
+    int      best_strat = 0, best_method = 0;
     char *out;
     int m;
     size_t out_len;
@@ -1250,6 +1259,8 @@ char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
     for (m = 0; m < M_LAST; m++) {
 	if (!(methods & (1<<m)))
 	    continue;
+
+	out_len = UINT_MAX;
 
 	switch (m) {
 	case RANS0:
@@ -1267,6 +1278,17 @@ char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
 	    out_len = *out_size;
 	    break;
 	}
+
+	case RANSXN1:
+	    if (!fq->fixed_len) {
+		out = NULL;
+		break;
+	    }
+	    *strat = 0;
+	    out = (char *)rans_compress_4x16((uint8_t *)in, in_size, out_size,
+					     (fq->fixed_len<<8)+9);
+	    out_len = *out_size;
+	    break;
 
 	case LZP3:
 	    out = encode_names(in, in_size, 0 /* LZP + rANS o5 */,
@@ -1309,6 +1331,13 @@ char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
 	    break;
 	}
 
+	case SEQ_CUSTOM:
+	    *strat = (arg->slevel<<4) | (arg->both_strands<<3) | 1;
+	    out = encode_seq(in, in_size, fq->len, fq->num_records,
+			     arg->both_strands, arg->slevel, out_size);
+	    out_len = *out_size;
+	    break;
+
 	case FQZ0:
 	case FQZ1:
 	case FQZ2:
@@ -1337,8 +1366,15 @@ char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
 	    abort();
 	}
 
+	if (arg->verbose > 2) {
+	    char *secstr[] = {"name", "length", "sequence", "quality"};
+	    fprintf(stderr, "Try      %8s with method %2d %10d to %10d "
+		    "bytes\n", secstr[sec], m, in_size, (uint32_t)out_len);
+	}
+
 	if (best_sz > out_len) {
 	    best_sz = out_len;
+	    best_method = m;
 	    best_comp = out;
 	    best_strat = *strat;
 	} else {
@@ -1347,6 +1383,12 @@ char *compress_with_methods(fqz_gparams *gp, fastq *fq, uint32_t methods,
 	metrics_update(sec, m, in_size, out_len);
     }
     out = best_comp;
+
+    if (arg->verbose > 1) {
+	char *secstr[] = {"name", "length", "sequence", "quality"};
+	fprintf(stderr, "Compress %8s with method %2d %10d to %10d "
+		"bytes\n", secstr[sec], best_method, in_size, best_sz);
+    }
 
     *out_size = best_sz;
     *strat    = best_strat;
@@ -1374,7 +1416,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     gettimeofday(&tv1, NULL);
 #if 1
     method = metrics_method(SEC_NAME);
-    out = compress_with_methods(gp, fq, method, SEC_NAME,
+    out = compress_with_methods(gp, arg, fq, method, SEC_NAME,
 				fq->name_buf, fq->name_len,
 				&clen, &strat);
 #else
@@ -1419,7 +1461,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     uint8_t  meta[9];
 
     method = metrics_method(SEC_SEQ);
-    out = compress_with_methods(gp, fq, method, SEC_SEQ,
+    out = compress_with_methods(gp, arg, fq, method, SEC_SEQ,
 				fq->seq_buf, fq->seq_len,
 				&clen, &strat);
     meta[0] = strat;
@@ -1440,7 +1482,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     size_t out_len = 0;
 
     method = metrics_method(SEC_QUAL);
-    out = compress_with_methods(gp, fq, method, SEC_QUAL,
+    out = compress_with_methods(gp, arg, fq, method, SEC_QUAL,
 				fq->qual_buf, fq->qual_len,
 				&clen, &strat);
     meta[0] = strat;
@@ -1636,38 +1678,48 @@ static void *encode_thread(void *arg) {
 int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	   timings *t) {
     int rans_methods = (1<<RANS0) | (1<<RANS1) | (1<<RANS129) | (1<<RANS193);
+
     // Name
-    method_avail[SEC_NAME] = 1<<LZP3;
-    if (arg->nstrat == 1) {
-	method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
-	method_avail[SEC_NAME] |= 1<<(TOK3_3 + arg->nlevel/2-1);
+    if (arg->nauto) {
+	method_avail[SEC_NAME] = arg->nauto;
+    } else {
+	if (arg->nstrat == 1)
+	    method_avail[SEC_NAME] |= 1<<(TOK3_3 + arg->nlevel/2-1);
+	else if (arg->nstrat == 2)
+	    method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
+	else
+	    method_avail[SEC_NAME] = 1<<LZP3;
     }
-    if (arg->nstrat == 2)
-	method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
     
     // Seq
-    method_avail[SEC_SEQ] = rans_methods;
-    if (arg->sstrat == 1) {
-	if (arg->slevel >= 10)
-	    method_avail[SEC_SEQ] |= 1<<SEQ10;
-	if (arg->slevel >= 12) {
-	    if (arg->both_strands | arg->slevel > 12)
-		method_avail[SEC_SEQ] |= 1<<SEQ12B;
-	    else
-		method_avail[SEC_SEQ] |= 1<<SEQ12;
-	}
-	if (arg->slevel >= 13)
-	    method_avail[SEC_SEQ] |= 1<<SEQ13B;
-	if (arg->slevel >= 14)
-	    method_avail[SEC_SEQ] |= 1<<SEQ14B;
+    if (arg->scustom) {
+	method_avail[SEC_SEQ] = 1<<SEQ_CUSTOM;
+    } else {
+	if (arg->sauto)
+	    method_avail[SEC_SEQ] = arg->sauto;
+	else if (arg->sstrat == 1)
+	    method_avail[SEC_SEQ] = 1<<SEQ_CUSTOM;
+
+	if (!method_avail[SEC_SEQ])
+	    method_avail[SEC_SEQ] = rans_methods;
     }
 
     // Qual
-    method_avail[SEC_QUAL] = rans_methods;
-    if (arg->qstrat == 1) {
-	int m;
-	for (m = 0; m <= arg->qlevel && m <= 3; m++)
-	    method_avail[SEC_QUAL] |= 1<<(FQZ0+m);
+    if (arg->qauto) {
+	method_avail[SEC_QUAL] = arg->qauto;
+    } else {
+	if (arg->qstrat == 1) {
+	    if (arg->qlevel == 3)
+		method_avail[SEC_QUAL] = FQZ3;
+	    else if (arg->qlevel == 1)
+		method_avail[SEC_QUAL] = FQZ1;
+	    else if (arg->qlevel == 2)
+		method_avail[SEC_QUAL] = FQZ2;
+	    else
+		method_avail[SEC_QUAL] = FQZ0;
+	} else {
+	    method_avail[SEC_QUAL] = rans_methods;
+	}
     }
 
 #ifdef THREADED
@@ -1965,11 +2017,11 @@ void usage(FILE *fp) {
     fprintf(fp, "    -Q INT        Quality encoding strategy (0 to 3)\n");
     fprintf(fp, "\n");
     fprintf(fp, "Compression levels:\n");
-    fprintf(fp, "    -1            Equivalent to -n0 -s0 -q0 -b10M\n");
-    fprintf(fp, "    -3            Equivalent to -n1 -s0 -q0 -b100M\n");
-    fprintf(fp, "    -5            Equivalent to -n2 -s1 -q1 -b100M\n");
-    fprintf(fp, "    -7            Equivalent to -n2 -s1 -q1 -b500M -B -S14\n");
-    fprintf(fp, "    -9            Equivalent to -n2 -s1 -q1 -b1GM  -B -S15\n");
+    fprintf(fp, "    -1            Light compression; 10MB block and rANS only\n");
+    fprintf(fp, "    -3            100MB block and rANS/TOK3\n");
+    fprintf(fp, "    -5            100MB block and basic seq / qual FQZ modes (default)\n");
+    fprintf(fp, "    -7            500MB block and higher level FQZ modes\n");
+    fprintf(fp, "    -9            Maximum compression, with 1GB blocks\n");
 }
 
 int main(int argc, char **argv) {
@@ -1983,8 +2035,14 @@ int main(int argc, char **argv) {
 	.qlevel = 0,
 	.sstrat = 1, // 0=rans, 1=fqz
 	.slevel = 12,// seq context = 4^12 
+	.scustom= 0,
 	.nstrat = 2, // (0=rans), 1=tok3, 2=tok3 + comments
 	.nlevel = 5,
+	.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+	         |(1<<FQZ0) |(1<<FQZ1),
+	.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+	         |(1<<SEQ10)|(1<<SEQ12B),
+	.nauto  = (1<<LZP3)|(1<<TOK3_5_LZP),
 	.both_strands =0, // adjusts seq strat 1.
 	.verbose = 0,
 	.blk_size = BLK_SIZE,
@@ -2026,9 +2084,13 @@ int main(int argc, char **argv) {
 
 	case 's':
 	    arg.sstrat = atoi(optarg);
+	    if (!arg.sstrat)
+		arg.sauto = 0;
 	    break;
 	case 'S':
 	    arg.slevel = atoi(optarg);
+	    arg.sstrat = 1; // -S implies -s1
+	    arg.scustom = 1;
 	    if (arg.slevel < 0)
 		arg.slevel = 0;
 	    if (arg.slevel > 16)
@@ -2037,6 +2099,7 @@ int main(int argc, char **argv) {
 
 	case 'n':
 	    arg.nstrat = atoi(optarg);
+	    arg.nauto  = 0; // override combinatorial search
 	    break;
 	case 'N':
 	    arg.nlevel = atoi(optarg);
@@ -2048,9 +2111,15 @@ int main(int argc, char **argv) {
 
 	case 'q':
 	    arg.qstrat = atoi(optarg);
+	    if (arg.qstrat && !arg.qauto)
+		arg.qauto = 1<<FQZ0;
+	    else if (!arg.qstrat)
+		arg.qauto = 0;
 	    break;
 	case 'Q':
 	    arg.qlevel = atoi(optarg);
+	    arg.qstrat = 1; // -Q implies -q1
+	    arg.qauto  = 1<<(FQZ0+arg.qlevel); // override combinatorial search
 	    break;
 
 	case 'b': {
@@ -2070,49 +2139,47 @@ int main(int argc, char **argv) {
 	}
 
 	case '1':
-	    arg.nstrat = 0;
-	    arg.sstrat = 0;
-	    arg.qstrat = 0;
+	    arg.nauto  = (1<<LZP3);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
+	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
 	    arg.blk_size = 10e6;
 	    break;
 
 	case '3':
-	    arg.nstrat = 1;
-	    arg.nlevel = 3;
-	    arg.sstrat = 0;
-	    arg.qstrat = 0;
+	    arg.nauto  = (1<<LZP3)|(1<<TOK3_3_LZP);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
+	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       | (1<<RANSXN1);
 	    arg.blk_size = 100e6;
 	    break;
 
 	case '5':
-	    arg.nstrat = 2;
-	    arg.nlevel = 5;
-	    arg.sstrat = 1;
-	    arg.qstrat = 1;
+	    arg.nauto  = (1<<LZP3)|(1<<TOK3_5_LZP);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       | (1<<SEQ10)|(1<<SEQ12B);
+	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       | (1<<RANSXN1) | (1<<FQZ0) |(1<<FQZ1);
 	    arg.blk_size = 100e6;
-	    arg.qlevel = 1;
 	    break;
 
 	case '7':
-	    // TODO: also add format detection, so qlevel is adjusted
-	    // per file.  Or auto-sensing and learning strategy (ala CRAM)
-	    arg.nstrat = 2;
-	    arg.nlevel = 7;
-	    arg.sstrat = 1;
-	    arg.both_strands = 1;
-	    arg.slevel = 14;
-	    arg.qstrat = 1;
-	    arg.qlevel = 3;
+	    arg.nauto  = (1<<LZP3)|(1<<TOK3_7_LZP)|(1<<TOK3_7);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       |(1<<RANS65)|(1<<SEQ10)|(1<<SEQ12B)|(1<<SEQ13B);
+	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       |(1<<RANS65)|(1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2);
+	    arg.blk_size = 500e6;
 	    break;
 
 	case '9':
-	    arg.nstrat = 2;
-	    arg.nlevel = 9;
-	    arg.sstrat = 1;
-	    arg.both_strands = 1;
-	    arg.slevel = 15;
-	    arg.qstrat = 1;
-	    arg.qlevel = 3;
+	    arg.nauto  = (1<<LZP3)|(1<<TOK3_9_LZP)|(1<<TOK3_9);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       | (1<<SEQ10)|(1<<SEQ12)|(1<<SEQ12B) |(1<<SEQ13B)
+		       | (1<<RANS64)|(1<<RANS65)|(1<<RANS128)|(1<<RANS129)
+		       |(1<<SEQ14B);
+	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+		       | (1<<RANS64)|(1<<RANS65)|(1<<RANS128)|(1<<RANS129)
+		       | (1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
 	    arg.blk_size = 1e9;
 	    break;
 
