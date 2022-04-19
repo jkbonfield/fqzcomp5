@@ -1375,6 +1375,8 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	if (best_sz > out_len) {
 	    best_sz = out_len;
 	    best_method = m;
+	    if (best_comp)
+		free(best_comp);
 	    best_comp = out;
 	    best_strat = *strat;
 	} else {
@@ -1809,6 +1811,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	fastq_free(fq);
 #endif
     }
+    free(in);
 
 #ifdef THREADED
     j = malloc(sizeof(*j));
@@ -1941,7 +1944,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 		} else {
 		    append_timings(t, &j->t, arg->verbose);
 		    output_fastq(out_fp, j->fq);
-		    free(j->fq);
+		    fastq_free(j->fq);
 		}
 		hts_tpool_delete_result(r, 1);
 	    }
@@ -1983,7 +1986,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 	} else {
 	    append_timings(t, &j->t, arg->verbose);
 	    output_fastq(out_fp, j->fq);
-	    free(j->fq);
+	    fastq_free(j->fq);
 	}
 	hts_tpool_delete_result(r, 1);
     }
