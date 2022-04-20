@@ -94,6 +94,8 @@ QC   Compressed quality data
 //   We could separate model reset from block boundaries, so blocks are small
 //   but reset boundaries less common.
 
+// - Flag for "+" (3rd record) duplicating first "@".
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -216,7 +218,7 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
     fastq *fq = calloc(1, sizeof(*fq));
     if (!fq)
 	goto err;
-    size_t name_sz = blk_size/4;
+    size_t name_sz = blk_size/10;
     size_t seq_sz  = blk_size/2;
     size_t qual_sz = blk_size/2;
     char *name_buf = fq->name_buf = malloc(name_sz);
@@ -339,6 +341,11 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
     fq->seq_len  = seq_i;
     fq->qual_len = qual_i;
     fq->num_records = nr;
+
+    // Reduce memory wastage
+    fq->name_buf = realloc(fq->name_buf, name_i);
+    fq->seq_buf  = realloc(fq->seq_buf,  seq_i);
+    fq->qual_buf = realloc(fq->qual_buf, qual_i);
 
     return fq;
 
@@ -1726,7 +1733,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 #ifdef THREADED
     int n = arg->nthread, end = 0;
     hts_tpool *p = hts_tpool_init(n);
-    hts_tpool_process *q = hts_tpool_process_init(p, n*2, 0);
+    hts_tpool_process *q = hts_tpool_process_init(p, n, 0);
     hts_tpool_result *r;
     enc_dec_job *j, *jr;
 #endif
@@ -1896,7 +1903,7 @@ int decode(FILE *in_fp, FILE *out_fp, opts *arg, timings *t) {
 #ifdef THREADED
     int n = arg->nthread, end = 0;
     hts_tpool *p = hts_tpool_init(n);
-    hts_tpool_process *q = hts_tpool_process_init(p, n*2, 0);
+    hts_tpool_process *q = hts_tpool_process_init(p, n, 0);
     hts_tpool_result *r;
     enc_dec_job *j;
 #endif
