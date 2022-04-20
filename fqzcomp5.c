@@ -125,7 +125,7 @@ QC   Compressed quality data
 #endif
 
 // Review metrics stats every X blocks for Y trials
-#define METRICS_REVIEW 50
+#define METRICS_REVIEW 100
 #define METRICS_TRIAL 3
 
 typedef enum {
@@ -1242,11 +1242,10 @@ int metrics_method(int sec) {
 // Update the metrics for a given section and method.
 // Method parameter isn't a bitfield, but the method number itself.
 void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
-    pthread_mutex_lock(&metric_m);
+    //pthread_mutex_lock(&metric_m);
     stats[sec].usize[method] += usize;
     stats[sec].csize[method] += csize;
-    stats[sec].trial--;
-    pthread_mutex_unlock(&metric_m);
+    //pthread_mutex_unlock(&metric_m);
     //fprintf(stderr, "Section %d  method %d  size %ld\n", sec, method, csize);
 }
 
@@ -1261,6 +1260,8 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
     char *out;
     int m;
     size_t out_len;
+
+    metrics local_stats = {{0}};
 
     for (m = 0; m < M_LAST; m++) {
 	if (!(methods & (1<<m)))
@@ -1388,8 +1389,22 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	} else {
 	    free(out);
 	}
-	metrics_update(sec, m, in_size, out_len);
+
+	local_stats.usize[m] = in_size;
+	local_stats.csize[m] = out_len;
     }
+
+    pthread_mutex_lock(&metric_m);
+    if (stats[sec].trial > 0) {
+	for (m = 0; m < M_LAST; m++) {
+	    if (!(methods & (1<<m)))
+		continue;
+	    metrics_update(sec, m, local_stats.usize[m], local_stats.csize[m]);
+	    stats[sec].trial--;
+	}
+    }
+    pthread_mutex_unlock(&metric_m);
+
     out = best_comp;
 
     if (arg->verbose > 1) {
