@@ -78,9 +78,9 @@ QC   Compressed quality data
 
 // - Entropy encoding of read length stream
 
-// - Exploration of multiple rans options (o4, o5, o133, o197?)
-
 // - Reuse of memory buffers for speed
+
+// - Also check why memory usage is so high.  Is it all in data models?
 
 // - Increase sizes of fqzcomp contexts?  Not so useful for CRAM, but maybe
 //   it's still beneficial to go beyond 16-bit.
@@ -1205,9 +1205,7 @@ int metrics_method(int sec) {
     int method;
     if (stats[sec].trial>0) {
 	method = method_avail[sec];
-	stats[sec].trial--;
-    } else if (stats[sec].trial == 0) {
-	stats[sec].trial--;
+    } else if (stats[sec].trial <= 0) {
 	int m, best_m = 0;
 	uint32_t best_sz = UINT_MAX;
 	for (m = 0; m < M_LAST; m++) {
@@ -1240,6 +1238,7 @@ void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
     pthread_mutex_lock(&metric_m);
     stats[sec].usize[method] += usize;
     stats[sec].csize[method] += csize;
+    stats[sec].trial--;
     pthread_mutex_unlock(&metric_m);
     //fprintf(stderr, "Section %d  method %d  size %ld\n", sec, method, csize);
 }
@@ -1362,7 +1361,7 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	}
 
 	default:
-	    fprintf(stderr, "Unsupported method %d (set 0x%x)\n", m, methods);
+	    fprintf(stderr, "Unsupported method %d (set 0x%x) for section %d\n", m, methods, sec);
 	    abort();
 	}
 
