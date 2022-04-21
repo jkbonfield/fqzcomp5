@@ -2182,7 +2182,7 @@ int main(int argc, char **argv) {
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<SEQ10)|(1<<SEQ12B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       | (1<<RANSXN1) | (1<<FQZ0) |(1<<FQZ1);
+		       | (1<<RANSXN1) | (1<<FQZ1) |(1<<FQZ3);
 	    arg.blk_size = 100e6;
 	    break;
 
@@ -2191,7 +2191,8 @@ int main(int argc, char **argv) {
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       |(1<<RANS65)|(1<<SEQ10)|(1<<SEQ12B)|(1<<SEQ13B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       |(1<<RANS65)|(1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2);
+		       |(1<<RANS65)
+		       |(1<<FQZ0)  |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
 	    arg.blk_size = 500e6;
 	    break;
 
@@ -2243,7 +2244,17 @@ int main(int argc, char **argv) {
     }
 
     in_fp = optind < argc ? fopen(argv[optind], "r") : stdin;
+    if (!in_fp) {
+	perror(argv[optind]);
+	return 1;
+    }
+
     out_fp = ++optind < argc ? fopen(argv[optind], "wb") : stdout;
+    if (!out_fp) {
+	perror(argv[optind]);
+	return 1;
+    }
+
 
     // FIXME: use variable sized integers
 
