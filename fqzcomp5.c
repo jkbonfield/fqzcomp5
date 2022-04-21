@@ -164,6 +164,7 @@ typedef enum {
 typedef struct {
     uint64_t usize[M_LAST], csize[M_LAST];   // current accumulated sizes
     int review, trial;
+    int count[M_LAST];
 } metrics;
 
 pthread_mutex_t metric_m = PTHREAD_MUTEX_INITIALIZER;
@@ -1122,6 +1123,7 @@ typedef struct {
     int64_t susize, scsize, stime;
     int64_t qusize, qcsize, qtime;
     int64_t lusize, lcsize, ltime;
+    int nmeth, smeth, qmeth, lmeth;
 } timings;
 
 static inline uint64_t tvdiff(struct timeval *tv1, struct timeval *tv2) {
@@ -1176,14 +1178,14 @@ void append_timings(timings *t1, timings *t2, int verbose) {
     t1->ltime  += t2->ltime;
 
     if (verbose) {
-	fprintf(stderr, "Names   %10ld to %10ld in %.2f sec\n",
-		t2->nusize, t2->ncsize, t2->ntime/1e6);
-	fprintf(stderr, "Lengths %10ld to %10ld in %.2f sec\n",
-		t2->lusize, t2->lcsize, t2->ltime/1e6);
-	fprintf(stderr, "Seqs    %10ld to %10ld in %.2f sec\n",
-		t2->susize, t2->scsize, t2->stime/1e6);
-	fprintf(stderr, "Quals   %10ld to %10ld in %.2f sec\n\n",
-		t2->qusize, t2->qcsize, t2->qtime/1e6);
+	fprintf(stderr, "Names   %11ld to %11ld in %.2f sec method %d\n",
+		t2->nusize, t2->ncsize, t2->ntime/1e6, t2->nmeth);
+	fprintf(stderr, "Lengths %11ld to %11ld in %.2f sec method %d\n",
+		t2->lusize, t2->lcsize, t2->ltime/1e6, t2->lmeth);
+	fprintf(stderr, "Seqs    %11ld to %11ld in %.2f sec method %d\n",
+		t2->susize, t2->scsize, t2->stime/1e6, t2->smeth);
+	fprintf(stderr, "Quals   %11ld to %11ld in %.2f sec method %d\n\n",
+		t2->qusize, t2->qcsize, t2->qtime/1e6, t2->qmeth);
     }
 }
 
@@ -1202,23 +1204,28 @@ void append_timings(timings *t1, timings *t2, int verbose) {
 int metrics_method(int sec) {
     pthread_mutex_lock(&metric_m);
 
-    if (stats[sec].review == 0) {
+    if (stats[sec].review <= 0) {
 	stats[sec].review = METRICS_REVIEW;
 	stats[sec].trial  = METRICS_TRIAL;
 	memset(stats[sec].usize, 0, M_LAST * sizeof(*stats[sec].usize));
 	memset(stats[sec].csize, 0, M_LAST * sizeof(*stats[sec].csize));
+	memset(stats[sec].count, 0, M_LAST * sizeof(*stats[sec].count));
     }
 
     int method;
     if (stats[sec].trial>0) {
+	// Under evaluation => all methods used
 	method = method_avail[sec];
-    } else if (stats[sec].trial <= 0) {
+    } else if (stats[sec].trial <= 0 && stats[sec].trial > -99999) {
+	// Trial finished => select best method and set review timer
+
 	int m, best_m = 0;
-	uint32_t best_sz = UINT_MAX;
+	//uint32_t best_sz = UINT_MAX;
+	double best_sz = 1e30;
 	for (m = 0; m < M_LAST; m++) {
 	    // TODO: parameterise by speed too, plus small block offset?
-	    if (best_sz > stats[sec].csize[m] && stats[sec].csize[m]) {
-		best_sz = stats[sec].csize[m];
+	    if (stats[sec].usize[m] && best_sz > (stats[sec].csize[m]+1.0)/stats[sec].usize[m]) {
+		best_sz = (stats[sec].csize[m]+1.0)/stats[sec].usize[m];
 		best_m = m;
 	    }
 	}
@@ -1226,13 +1233,16 @@ int metrics_method(int sec) {
 	method_used[sec] = best_m;
 	method = 1<<method_used[sec];
 
+	stats[sec].trial  = -99999;
+
 	// TODO: methods that consistently get rejected can be removed from
 	// the method_avail.  This is a second level based on
 	// total accumulated size stats.
     } else {
+	// Repeat best method until review counter hits zero again
+	stats[sec].review--;
 	method = 1<<method_used[sec];
     }
-    stats[sec].review--;
 
     pthread_mutex_unlock(&metric_m);
 
@@ -1242,9 +1252,12 @@ int metrics_method(int sec) {
 // Update the metrics for a given section and method.
 // Method parameter isn't a bitfield, but the method number itself.
 void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
+    if (stats[sec].trial <= 0)
+	return; // done
     //pthread_mutex_lock(&metric_m);
     stats[sec].usize[method] += usize;
     stats[sec].csize[method] += csize;
+    stats[sec].count[method]++;
     //pthread_mutex_unlock(&metric_m);
     //fprintf(stderr, "Section %d  method %d  size %ld\n", sec, method, csize);
 }
@@ -1253,13 +1266,18 @@ void metrics_update(int sec, int method, int64_t usize, int64_t csize) {
 char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 			    uint32_t methods,
 			    int sec, char *in, unsigned int in_size,
-			    unsigned int *out_size, int *strat) {
+			    unsigned int *out_size, int *strat,
+			    int *meth_used) {
     uint8_t *best_comp = NULL;
     uint32_t best_sz = UINT_MAX;
     int      best_strat = 0, best_method = 0;
     char *out;
     int m;
     size_t out_len;
+
+    pthread_mutex_lock(&metric_m);
+    int in_trial = stats[sec].trial > 0;
+    pthread_mutex_unlock(&metric_m);
 
     metrics local_stats = {{0}};
 
@@ -1394,16 +1412,16 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	local_stats.csize[m] = out_len;
     }
 
-    pthread_mutex_lock(&metric_m);
-    if (stats[sec].trial > 0) {
+    if (in_trial) {
+	pthread_mutex_lock(&metric_m);
 	for (m = 0; m < M_LAST; m++) {
 	    if (!(methods & (1<<m)))
 		continue;
 	    metrics_update(sec, m, local_stats.usize[m], local_stats.csize[m]);
-	    stats[sec].trial--;
 	}
+	stats[sec].trial--;
+	pthread_mutex_unlock(&metric_m);
     }
-    pthread_mutex_unlock(&metric_m);
 
     out = best_comp;
 
@@ -1415,6 +1433,7 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 
     *out_size = best_sz;
     *strat    = best_strat;
+    *meth_used = best_method;
     return out;
 }
 
@@ -1441,7 +1460,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     method = metrics_method(SEC_NAME);
     out = compress_with_methods(gp, arg, fq, method, SEC_NAME,
 				fq->name_buf, fq->name_len,
-				&clen, &strat);
+				&clen, &strat, &t->nmeth);
 #else
     out = encode_names((uint8_t *)fq->name_buf, fq->name_len, arg->nstrat,
 		       arg->nlevel, &clen);
@@ -1461,6 +1480,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
 	buf[0] = nb-1;
 	update_stats(t, 3, 4*fq->num_records, nb, 0);
 	APPEND_OUT(buf, nb);
+	t->lmeth = 1;
     } else {
 	// Variable length (next byte 0), with 4 byte len followed
 	// by var-int lengths.
@@ -1476,6 +1496,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
 	free(buf);
 
 	update_stats(t, 3, 4*fq->num_records, nb, 0);
+	t->lmeth = 0;
     }
 
     //----------
@@ -1486,7 +1507,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     method = metrics_method(SEC_SEQ);
     out = compress_with_methods(gp, arg, fq, method, SEC_SEQ,
 				fq->seq_buf, fq->seq_len,
-				&clen, &strat);
+				&clen, &strat, &t->smeth);
     meta[0] = strat;
 
     *(uint32_t *)(&meta[1]) = fq->seq_len;
@@ -1507,7 +1528,7 @@ char *encode_block(fqz_gparams *gp, opts *arg, fastq *fq, timings *t,
     method = metrics_method(SEC_QUAL);
     out = compress_with_methods(gp, arg, fq, method, SEC_QUAL,
 				fq->qual_buf, fq->qual_len,
-				&clen, &strat);
+				&clen, &strat, &t->qmeth);
     meta[0] = strat;
     //fprintf(stderr, "Qual %d -> %d via %d\n", fq->qual_len, clen, strat);
 
