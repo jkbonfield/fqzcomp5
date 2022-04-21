@@ -143,7 +143,8 @@ typedef enum {
     RANSXN1,
 
     // LZP; differing min lengths?  Make len part of format?
-    LZP3, /* TODO: could use on seq too maybe */
+    LZP3,
+    TLZP3, // tok3+lzp
     // TODO LZP2, LZP4, LZP16? Needs storing in byte stream too
 
     // Name specific; may just use arg.slevel and ignore multiplicity here?
@@ -1315,7 +1316,17 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	    out_len = *out_size;
 	    break;
 
-	case LZP3:
+	case LZP3: {
+	    unsigned char *lzp_out = malloc(in_size*2+1000);
+	    unsigned int lzp_len = lzp(in, in_size, lzp_out);
+	    out = (char *)rans_compress_4x16(lzp_out, lzp_len, out_size, 5);
+	    free(lzp_out);
+	    out_len = *out_size;
+	    *strat = LZP3;
+	    break;
+	}
+
+	case TLZP3:
 	    out = encode_names(in, in_size, 0 /* LZP + rANS o5 */,
 			       (m-TOK3_3)*2+3, out_size);
 	    out_len = *out_size;
@@ -1630,8 +1641,17 @@ fastq *decode_block(unsigned char *in, unsigned int in_size, timings *t) {
     if ((c & 7) == 1) {
 	out = (uint8_t *)decode_seq(comp, c_len, fq->len, fq->num_records,
 				    both_strands, slevel, u_len);
-    } else {
+    } else if (c == LZP3) {
+	unsigned int ru_len;
+	unsigned char *rout = rans_uncompress_4x16(comp, c_len, &ru_len);
+	out = malloc(u_len);
+	u_len = unlzp(rout, ru_len, out);
+	free(rout);
+    } else if (c == 0) {
 	out = rans_uncompress_4x16(comp, c_len, &u_len);
+    } else {
+	fprintf(stderr, "Unrecognised sequence strategy %d\n", c);
+	goto err;
     }
 
     fq->seq_buf = (char *)out;
@@ -1732,7 +1752,7 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	else if (arg->nstrat == 2)
 	    method_avail[SEC_NAME] |= 1<<(TOK3_3_LZP + arg->nlevel/2-1);
 	else
-	    method_avail[SEC_NAME] = 1<<LZP3;
+	    method_avail[SEC_NAME] = 1<<TLZP3;
     }
     
     // Seq
@@ -2087,7 +2107,7 @@ int main(int argc, char **argv) {
 	         |(1<<FQZ0) |(1<<FQZ1),
 	.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 	         |(1<<SEQ10)|(1<<SEQ12B),
-	.nauto  = (1<<LZP3)|(1<<TOK3_5_LZP),
+	.nauto  = (1<<TLZP3)|(1<<TOK3_5_LZP),
 	.both_strands =0, // adjusts seq strat 1.
 	.verbose = 0,
 	.blk_size = BLK_SIZE,
@@ -2184,33 +2204,34 @@ int main(int argc, char **argv) {
 	}
 
 	case '1':
-	    arg.nauto  = (1<<LZP3);
-	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
+	    arg.nauto  = (1<<TLZP3);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)|(1<<LZP3);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
 	    arg.blk_size = 10e6;
 	    break;
 
 	case '3':
-	    arg.nauto  = (1<<LZP3)|(1<<TOK3_3_LZP);
-	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193);
+	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_3_LZP);
+	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
+	               | (1<<LZP3);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<RANSXN1);
 	    arg.blk_size = 100e6;
 	    break;
 
 	case '5':
-	    arg.nauto  = (1<<LZP3)|(1<<TOK3_5_LZP);
+	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_5_LZP);
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       | (1<<SEQ10)|(1<<SEQ12B);
+		       | (1<<LZP3) | (1<<SEQ10)|(1<<SEQ12B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<RANSXN1) | (1<<FQZ1) |(1<<FQZ3);
 	    arg.blk_size = 100e6;
 	    break;
 
 	case '7':
-	    arg.nauto  = (1<<LZP3)|(1<<TOK3_7_LZP)|(1<<TOK3_7);
+	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_7_LZP)|(1<<TOK3_7);
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       |(1<<RANS65)|(1<<SEQ10)|(1<<SEQ12B)|(1<<SEQ13B);
+		       | (1<<LZP3) |(1<<RANS65)|(1<<SEQ10)|(1<<SEQ12B)|(1<<SEQ13B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       |(1<<RANS65)
 		       |(1<<FQZ0)  |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
@@ -2218,11 +2239,11 @@ int main(int argc, char **argv) {
 	    break;
 
 	case '9':
-	    arg.nauto  = (1<<LZP3)|(1<<TOK3_9_LZP)|(1<<TOK3_9);
+	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_9_LZP)|(1<<TOK3_9);
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       | (1<<SEQ10)|(1<<SEQ12)|(1<<SEQ12B) |(1<<SEQ13B)
 		       | (1<<RANS64)|(1<<RANS65)|(1<<RANS128)|(1<<RANS129)
-		       |(1<<SEQ14B);
+		       | (1<<LZP3) | (1<<SEQ10)|(1<<SEQ12)|(1<<SEQ12B)
+		       |(1<<SEQ13B)|(1<<SEQ14B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<RANS64)|(1<<RANS65)|(1<<RANS128)|(1<<RANS129)
 		       | (1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
