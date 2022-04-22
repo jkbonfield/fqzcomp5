@@ -144,7 +144,7 @@ typedef enum {
 
     // LZP; differing min lengths?  Make len part of format?
     LZP3,
-    TLZP3, // tok3+lzp
+    TLZP3, // name lzp; fold into LZP3 with better format structuring.
     // TODO LZP2, LZP4, LZP16? Needs storing in byte stream too
 
     // Name specific; may just use arg.slevel and ignore multiplicity here?
@@ -161,6 +161,20 @@ typedef enum {
 
     M_LAST,
 } methods;
+
+int method_costs[] = {
+    1.0, 1.1, 1.1, 1.2, 0.5, 0.7, 1.0, 1.2, 1.2, // various RANS
+
+    1.3, // LZP3
+    1.3, // TLZP3
+
+    1.3, 1.4, 1.5, 1.6, // TOK3
+    1.3, 1.4, 1.5, 1.6, // TOK3+LZP
+
+    1.7, 1.8, 1.9, 2.0, 2.2, 1.5, // FQZ-SEQ
+
+    1.3, 1.3, 1.3, 1.3, // FQZ-QUAL
+};
 
 typedef struct {
     uint64_t usize[M_LAST], csize[M_LAST];   // current accumulated sizes
@@ -252,7 +266,7 @@ fastq *load_seqs(char *in, int blk_size, int *last_offset) {
 
 	int name_i_ = name_i; // tmp copy so we can unwind a partial decode
 	while (i < blk_size && (c = in[i++]) && c != '\n') {
-	    if (name_i_ >= name_sz) {
+	    if (name_i_+1 >= name_sz) {
 		name_sz = name_sz * 1.5 + 1000;
 		name_buf = fq->name_buf = realloc(fq->name_buf, name_sz);
 	    }
