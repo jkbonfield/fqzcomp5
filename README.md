@@ -1,4 +1,4 @@
-Fqzcomp5
+Fqzcomp5 (ALPHA)
 ========
 
 This is a reimplementation of the old fqzcomp-4.x tool using the new
@@ -58,7 +58,7 @@ paper.
 | Tool                 | Total(MB)  | Name | Lengths  | Sequence | Qual  |  Elapsed(s) | CPU (s) |
 | -------------------- | ---------: | ---: | -------: | -------: | ----: | ----------: | ------: |
 | gzip                 |      36652 |      |          |          |       |             |         |
-| mpeg-g (no assembly) |      24112 |  376 | (in seq) |    10249 | 13486 |        1193 |    6166 |
+| mpeg-g (no assembly) |      24112 |  376 | (in seq) |    10249 | 13486 |  (-@8) 1193 |    6166 |
 | fqzcomp5 -1          |      26652 | 2743 |        0 |    10104 | 13813 |         904 |    1145 |
 | fqzcomp5 -3          |      25682 | 1770 |        0 |    10103 | 13808 |        1111 |    1600 |
 | fqzcomp5 -5          |      23355 | 1770 |        0 |     9548 | 12037 |        1542 |    5472 |
@@ -218,3 +218,29 @@ the fqzcomp statistical model.  On this data set it's doesn't have a
 large memory and CPU usage, although this can become an issue with
 bigger datasets as seen above
 
+
+TO DO
+=====
+
+- Include support for input and output of gzipped FASTQ.
+
+  For now, use something like `zcat in.fastq.gz | mbuffer | fqzcomp5 > out.fqz5`.
+
+- Accept pairs of fastq files and do automatic interleaving.  This
+  helps improve compression of read-names through deduplication and
+  may also help sequence compression for short inserts.
+
+- Improve file format.  A proper magic number, better blocking
+  structure.
+
+- Implement (coarse) random access capability.  This is already
+  supported by the format, but lacks the necessary index.
+
+- Support the third line of "+name" where "name" is a duplicate of
+  "@name".  This is rarely used, but could be supported by a simple
+  flag.
+
+- Push more changes back into htscodecs upstream.  For now we're using
+  out own fork.
+
+- Fuzz testing.
