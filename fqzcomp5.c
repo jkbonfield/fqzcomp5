@@ -157,7 +157,7 @@ typedef enum {
     SEQ10, SEQ12, SEQ12B, SEQ13B, SEQ14B, SEQ_CUSTOM,
 
     // Qual
-    FQZ0, FQZ1, FQZ2, FQZ3,
+    FQZ0, FQZ1, FQZ2, FQZ3, FQZ4,
 
     M_LAST,
 } methods;
@@ -173,7 +173,7 @@ int method_costs[] = {
 
     1.7, 1.8, 1.9, 2.0, 2.2, 1.5, // FQZ-SEQ
 
-    1.3, 1.3, 1.3, 1.3, // FQZ-QUAL
+    1.3, 1.3, 1.3, 1.3, 1.3, // FQZ-QUAL
 };
 
 typedef struct {
@@ -1391,7 +1391,8 @@ char *compress_with_methods(fqz_gparams *gp,  opts *arg, fastq *fq,
 	case FQZ0:
 	case FQZ1:
 	case FQZ2:
-	case FQZ3: {
+	case FQZ3:
+	case FQZ4: {
 	    *strat = 1;
 	    fqz_slice *s = malloc(fq->num_records * sizeof(*s));
 	    s->num_records = fq->num_records;
@@ -1787,7 +1788,9 @@ int encode(FILE *in_fp, FILE *out_fp, fqz_gparams *gp, opts *arg,
 	method_avail[SEC_QUAL] = arg->qauto;
     } else {
 	if (arg->qstrat == 1) {
-	    if (arg->qlevel == 3)
+	    if (arg->qlevel == 4)
+		method_avail[SEC_QUAL] = FQZ4;
+	    else if (arg->qlevel == 3)
 		method_avail[SEC_QUAL] = FQZ3;
 	    else if (arg->qlevel == 1)
 		method_avail[SEC_QUAL] = FQZ1;
@@ -2234,7 +2237,7 @@ int main(int argc, char **argv) {
 	    break;
 
 	case '5':
-	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_5_LZP);
+	    arg.nauto  = (1<<TLZP3)|(1<<TOK3_5_LZP);//|(1<<TOK3_5);
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<LZP3) | (1<<SEQ10)|(1<<SEQ12B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
@@ -2247,8 +2250,8 @@ int main(int argc, char **argv) {
 	    arg.sauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<LZP3) |(1<<RANS65)|(1<<SEQ10)|(1<<SEQ12B)|(1<<SEQ13B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
-		       |(1<<RANS65)
-		       |(1<<FQZ0)  |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
+		       |(1<<RANS65)|(1<<FQZ0) |(1<<FQZ1)   |(1<<FQZ2)
+		       |(1<<FQZ3)  |(1<<FQZ4);
 	    arg.blk_size = 500e6;
 	    break;
 
@@ -2260,7 +2263,8 @@ int main(int argc, char **argv) {
 		       |(1<<SEQ13B)|(1<<SEQ14B);
 	    arg.qauto  = (1<<RANS0)|(1<<RANS1)|(1<<RANS129)|(1<<RANS193)
 		       | (1<<RANS64)|(1<<RANS65)|(1<<RANS128)|(1<<RANS129)
-		       | (1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3);
+		       | (1<<FQZ0) |(1<<FQZ1) |(1<<FQZ2)   |(1<<FQZ3)
+		       | (1<<FQZ4);
 	    arg.blk_size = 1e9;
 	    break;
 
